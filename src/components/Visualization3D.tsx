@@ -10,6 +10,7 @@ import {
 import { Canvas } from '@react-three/fiber'
 import Scene from './3d/Scene'
 import { Satellite, ManeuverAnalysis } from '../types'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 
 interface Visualization3DProps {
   satellites: Satellite[]
@@ -24,7 +25,7 @@ const Visualization3D: React.FC<Visualization3DProps> = ({
   onSatelliteClick,
   maneuverAnalysis,
 }) => {
-  const controlsRef = useRef<unknown>(null)
+  const controlsRef = useRef<OrbitControlsImpl>(null)
   const [autoRotate, setAutoRotate] = useState(false)
   const [showLayers, setShowLayers] = useState(true)
 

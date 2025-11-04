@@ -1,6 +1,6 @@
 import React from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { AppBar, Box, CssBaseline, Toolbar, Typography, Stack, Chip, Button } from '@mui/material'
+import { AppBar, Box, CssBaseline, Toolbar, Typography, Stack, Chip, Button, Theme } from '@mui/material'
 import SatelliteAltIcon from '@mui/icons-material/SatelliteAlt'
 import HomeIcon from '@mui/icons-material/Home'
 import DashboardIcon from '@mui/icons-material/Dashboard'
@@ -29,7 +29,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
         position="fixed"
         sx={{
           top: 32, // Offset for classification banner
-          zIndex: theme => theme.zIndex.drawer + 1,
+          zIndex: (theme: Theme) => theme.zIndex.drawer + 1,
         }}
       >
         <Toolbar>

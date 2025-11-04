@@ -187,8 +187,8 @@ const ScenarioDetailView: React.FC = () => {
     )
   }
 
-  const handleSatelliteClick = (satelliteId: string) => {
-    handleToggleSatellite(satelliteId)
+  const handleSatelliteClick = (satellite: Satellite) => {
+    handleToggleSatellite(satellite.id)
   }
 
   const handleSensorHighlight = (sensors: string[]) => {

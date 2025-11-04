@@ -4,12 +4,13 @@ import Earth from './Earth'
 import Satellite from './Satellite'
 import OrbitalPath from './OrbitalPath'
 import { Satellite as SatelliteType, ManeuverAnalysis } from '../../types'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 
 interface SceneProps {
   satellites: SatelliteType[]
   currentTime: Date
   onSatelliteClick?: (satellite: SatelliteType) => void
-  controlsRef?: React.RefObject<unknown>
+  controlsRef?: React.RefObject<OrbitControlsImpl>
   maneuverAnalysis?: ManeuverAnalysis | null
 }
 
