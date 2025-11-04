@@ -1,0 +1,57 @@
+# Netlify configuration for production deployment
+# Documentation: https://docs.netlify.com/configure-builds/file-based-configuration/
+
+[build]
+  # Build command
+  command = "npm run build"
+  
+  # Directory to deploy
+  publish = "dist"
+  
+  # Environment variables for build
+  [build.environment]
+    NODE_VERSION = "18"
+    NPM_FLAGS = "--legacy-peer-deps"
+
+# SPA fallback - redirect all routes to index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Security headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "SAMEORIGIN"
+    X-XSS-Protection = "1; mode=block"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "geolocation=(), microphone=(), camera=()"
+
+# Cache static assets
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Don't cache index.html
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# Production context (branch: main/master)
+[context.production]
+  command = "npm run build"
+  [context.production.environment]
+    NODE_ENV = "production"
+
+# Deploy Preview context
+[context.deploy-preview]
+  command = "npm run build"
+
+# Branch deploy context
+[context.branch-deploy]
+  command = "npm run build"
+
