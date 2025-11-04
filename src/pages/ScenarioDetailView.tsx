@@ -57,7 +57,7 @@ import ThreatAssessmentPanel from '../components/ThreatAssessmentPanel'
 import C2AlertPanel from '../components/C2AlertPanel'
 import SSNDataFeed from '../components/SSNDataFeed'
 import { useTheme as useMuiTheme } from '@mui/material/styles'
-import { ManeuverAnalysis } from '../types'
+import { ManeuverAnalysis, Satellite } from '../types'
 
 const ScenarioDetailView: React.FC = () => {
   const { scenarioId } = useParams<{ scenarioId: string }>()
