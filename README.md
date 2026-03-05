@@ -261,16 +261,16 @@ Satelite demo/
 
 ---
 
-## 🚀 Deployment
+## 🚀 Running the Application
 
 ### Development Mode
 ```bash
-npm run dev  # Runs on localhost:3000 with hot module reloading
+npm run dev  # Runs on localhost:5173 with hot module reloading
 ```
 
-### Production Server ⭐
+### Production Build & Preview
 ```bash
-npm start  # Builds and serves optimized production bundle on localhost:3000
+npm start  # Builds and serves optimized production bundle on localhost:4173
 ```
 
 This command automatically:
@@ -278,36 +278,7 @@ This command automatically:
 - ✅ Minifies and optimizes all assets with esbuild
 - ✅ Splits vendor chunks for optimal caching (React, MUI, Three.js)
 - ✅ Removes development code and source maps
-- ✅ Serves production build on port 3000
-
-### Manual Production Build
-```bash
-npm run build   # Creates optimized build in ./dist
-npm run preview # Serves the built files
-```
-
-### Production Optimizations Included
-- **Code Splitting**: Separate chunks for React, MUI, and Three.js vendors
-- **Tree Shaking**: Automatically removes unused code
-- **Minification**: esbuild-powered compression
-- **Asset Optimization**: Optimized images and static files
-- **ES2015+ Target**: Modern browser optimizations
-- **Chunk Size Management**: 1MB warning threshold for performance monitoring
-
-### Static Deployment Options
-The `dist/` folder contains static files ready to deploy to:
-- **CDN/Static Hosting**: Netlify, Vercel, GitHub Pages
-- **Cloud Storage**: AWS S3 + CloudFront, Azure Blob Storage
-- **Traditional Servers**: nginx, Apache, IIS
-
-### DoD IL4/IL5 Deployment (Future)
-- Deploy to AWS GovCloud or Azure Government
-- Integrate with SIPRNET for classified data
-- CAC authentication via DoD PKI
-- STIG-hardened containers
-- Redis for session management
-- PostgreSQL for audit logs
-- Nginx reverse proxy with SSL/TLS 1.3
+- ✅ Serves production build locally
 
 ---
 
@@ -316,9 +287,7 @@ The `dist/` folder contains static files ready to deploy to:
 | Command | Description |
 |---------|-------------|
 | `npm run dev` | Start development server with hot reload |
-| `npm run build` | Build for production |
-| `npm run preview` | Preview production build locally |
-| `npm run lint` | Run ESLint to check code quality |
+| `npm start` | Build and preview production bundle locally |
 
 ---
 

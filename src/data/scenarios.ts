@@ -126,7 +126,7 @@ export const telemetryDataISS: TelemetryData[] = [
   { parameter: 'Drag Coefficient', value: '2.2', unit: '', status: 'normal' },
 ]
 
-const telemetryDataStarlink: TelemetryData[] = [
+export const telemetryDataStarlink: TelemetryData[] = [
   { parameter: 'Altitude', value: '548.3', unit: 'km', status: 'warning' },
   { parameter: 'Velocity', value: '7.59', unit: 'km/s', status: 'warning' },
   { parameter: 'Inclination', value: '53.0', unit: '°', status: 'normal' },

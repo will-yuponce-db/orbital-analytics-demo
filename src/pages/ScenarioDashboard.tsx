@@ -14,21 +14,37 @@ import {
   Chip,
   Paper,
   Link,
+  CircularProgress,
 } from '@mui/material'
 import { Search as SearchIcon, History as HistoryIcon } from '@mui/icons-material'
-import { mockScenarios } from '../data/scenarios'
+import { api } from '../services/api'
 import ScenarioCard from '../components/ScenarioCard'
-import { DataQuality } from '../types'
+import { DataQuality, Scenario } from '../types'
 import { getRecentlyViewed, getRelativeTime } from '../utils/recentlyViewed'
 
 const ScenarioDashboard: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams()
+  const [scenarios, setScenarios] = useState<Scenario[]>([])
+  const [loading, setLoading] = useState(true)
 
   // Initialize state from URL parameters
   const [searchTerm, setSearchTerm] = useState(searchParams.get('search') || '')
   const [dataQualityFilter, setDataQualityFilter] = useState<DataQuality | 'all'>(
     (searchParams.get('quality') as DataQuality) || 'all'
   )
+
+  // Fetch scenarios from API
+  useEffect(() => {
+    api.getScenarios()
+      .then(data => {
+        setScenarios(data)
+        setLoading(false)
+      })
+      .catch(error => {
+        console.error('Failed to fetch scenarios:', error)
+        setLoading(false)
+      })
+  }, [])
 
   // Update URL when filters change
   useEffect(() => {
@@ -38,7 +54,7 @@ const ScenarioDashboard: React.FC = () => {
     setSearchParams(params, { replace: true })
   }, [searchTerm, dataQualityFilter, setSearchParams])
 
-  const filteredScenarios = mockScenarios.filter(scenario => {
+  const filteredScenarios = scenarios.filter(scenario => {
     const matchesSearch =
       scenario.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       scenario.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -50,7 +66,7 @@ const ScenarioDashboard: React.FC = () => {
   })
 
   const getCountByQuality = (quality: DataQuality) => {
-    return mockScenarios.filter(s => s.dataQuality === quality).length
+    return scenarios.filter((s: Scenario) => s.dataQuality === quality).length
   }
 
   // Keyboard shortcuts
@@ -70,6 +86,16 @@ const ScenarioDashboard: React.FC = () => {
   }, [])
 
   const recentlyViewed = getRecentlyViewed()
+
+  if (loading) {
+    return (
+      <Container maxWidth="xl">
+        <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '50vh' }}>
+          <CircularProgress />
+        </Box>
+      </Container>
+    )
+  }
 
   return (
     <Container maxWidth="xl">
@@ -131,7 +157,7 @@ const ScenarioDashboard: React.FC = () => {
           <Stack direction="row" spacing={3} flexWrap="wrap">
             <Box>
               <Typography variant="h4" fontWeight={600}>
-                {mockScenarios.length}
+                {scenarios.length}
               </Typography>
               <Typography variant="body2" color="text.secondary">
                 Total Scenarios

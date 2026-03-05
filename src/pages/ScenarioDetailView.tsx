@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Box,
@@ -35,16 +35,13 @@ import {
   Sensors as SSNIcon,
 } from '@mui/icons-material'
 import {
-  mockScenarios,
   createScenarioVariant,
   saveScenarioVariant,
-  threatObjects,
-  ewThreats,
-  c2Alerts,
-  ssnDataSources,
   mockUsers,
 } from '../data/scenarios'
+import { api } from '../services/api'
 import { addToRecentlyViewed } from '../utils/recentlyViewed'
+import type { Scenario, ThreatObject, EWThreat, C2Alert, SSNDataSource } from '../types'
 import DataQualityBadge from '../components/DataQualityBadge'
 import SatelliteList from '../components/SatelliteList'
 import Visualization3D from '../components/Visualization3D'
@@ -72,16 +69,50 @@ const ScenarioDetailView: React.FC = () => {
   const [snackbarOpen, setSnackbarOpen] = useState(false)
   const [snackbarMessage, setSnackbarMessage] = useState('')
   const [isLoading, setIsLoading] = useState(true)
-
-  const scenario = mockScenarios.find(s => s.id === scenarioId)
+  
+  // State for fetched data
+  const [scenario, setScenario] = useState<Scenario | null>(null)
+  const [threatObjects, setThreatObjects] = useState<ThreatObject[]>([])
+  const [ewThreats, setEWThreats] = useState<EWThreat[]>([])
+  const [c2Alerts, setC2Alerts] = useState<C2Alert[]>([])
+  const [ssnDataSources, setSSNDataSources] = useState<SSNDataSource[]>([])
 
   // Time state for 3D visualization
-  const [currentTime, setCurrentTime] = useState<Date>(() =>
-    scenario ? new Date(scenario.startTime) : new Date()
-  )
+  const [currentTime, setCurrentTime] = useState<Date>(new Date())
 
   // Satellite selection state
-  const [satellites, setSatellites] = useState(() => (scenario ? scenario.satellites : []))
+  const [satellites, setSatellites] = useState<Scenario['satellites']>([])
+
+  // Fetch data from API
+  useEffect(() => {
+    if (!scenarioId) return
+
+    Promise.all([
+      api.getScenario(scenarioId),
+      api.getThreats(),
+      api.getEWThreats(),
+      api.getC2Alerts(),
+      api.getSSNSources(),
+    ])
+      .then(([scenarioData, threats, ew, alerts, ssn]) => {
+        setScenario(scenarioData)
+        setThreatObjects(threats)
+        setEWThreats(ew)
+        setC2Alerts(alerts)
+        setSSNDataSources(ssn)
+        setSatellites(scenarioData.satellites)
+        setCurrentTime(new Date(scenarioData.startTime))
+        
+        // Add to recently viewed
+        addToRecentlyViewed(scenarioData.id, scenarioData.name)
+        
+        setIsLoading(false)
+      })
+      .catch(error => {
+        console.error('Failed to fetch scenario data:', error)
+        setIsLoading(false)
+      })
+  }, [scenarioId])
 
   // Handlers must be defined before early returns to avoid conditional hooks
   const handleTimeChange = useCallback((newTime: Date) => {
@@ -145,26 +176,13 @@ const ScenarioDetailView: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyPress)
   }, [isMobile, leftDrawerOpen])
 
-  // Update satellites when scenario changes and simulate loading
-  React.useEffect(() => {
-    if (scenario) {
-      setIsLoading(true)
-      setSatellites(scenario.satellites)
-      setCurrentTime(new Date(scenario.startTime))
-
-      // Add to recently viewed
-      addToRecentlyViewed(scenario.id, scenario.name)
-
-      // Simulate loading orbital calculations
-      const timer = setTimeout(() => {
-        setIsLoading(false)
-      }, 500)
-
-      return () => clearTimeout(timer)
-    } else {
-      setIsLoading(false)
-    }
-  }, [scenario])
+  if (isLoading) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '50vh' }}>
+        <CircularProgress />
+      </Box>
+    )
+  }
 
   if (!scenario) {
     return (
