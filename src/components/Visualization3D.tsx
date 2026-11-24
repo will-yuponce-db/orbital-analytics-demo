@@ -12,11 +12,20 @@ import Scene from './3d/Scene'
 import { Satellite, ManeuverAnalysis } from '../types'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 
+interface ConjunctionWarning {
+  satelliteANoradId: string
+  satelliteBNoradId: string
+  tca: string
+  riskTier: string
+  missDistanceKm: number
+}
+
 interface Visualization3DProps {
   satellites: Satellite[]
   currentTime: Date
   onSatelliteClick?: (satellite: Satellite) => void
   maneuverAnalysis?: ManeuverAnalysis | null
+  conjunctionWarnings?: ConjunctionWarning[]
 }
 
 const Visualization3D: React.FC<Visualization3DProps> = ({
@@ -24,6 +33,7 @@ const Visualization3D: React.FC<Visualization3DProps> = ({
   currentTime,
   onSatelliteClick,
   maneuverAnalysis,
+  conjunctionWarnings,
 }) => {
   const controlsRef = useRef<OrbitControlsImpl>(null)
   const [autoRotate, setAutoRotate] = useState(false)
@@ -154,6 +164,7 @@ const Visualization3D: React.FC<Visualization3DProps> = ({
             onSatelliteClick={onSatelliteClick}
             controlsRef={controlsRef}
             maneuverAnalysis={maneuverAnalysis}
+            conjunctionWarnings={conjunctionWarnings}
           />
         </Canvas>
       </Box>

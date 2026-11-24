@@ -1,12 +1,7 @@
-import { AuditLogEntry, ClassificationLevel } from '../types'
+import { AuditLogEntry } from '../types'
 
 /**
- * Audit Logger for DoD Cybersecurity Compliance
- *
- * Implements audit logging requirements per:
- * - NIST SP 800-53 (AU Family)
- * - DISA STIG requirements
- * - DoD 8500.01 Cybersecurity
+ * Audit Logger for Compliance
  */
 
 class AuditLogger {
@@ -23,7 +18,6 @@ class AuditLogger {
     resourceType: string,
     resourceId: string,
     details: string,
-    classification: ClassificationLevel,
     result: 'success' | 'failure' | 'denied' = 'success'
   ): void {
     const entry: AuditLogEntry = {
@@ -36,7 +30,6 @@ class AuditLogger {
       resourceId,
       details,
       ipAddress: this.getClientIP(),
-      classification,
       result,
     }
 
@@ -50,7 +43,6 @@ class AuditLogger {
     // In production, this would:
     // 1. Send to SIEM (Security Information and Event Management)
     // 2. Write to encrypted audit database
-    // 3. Forward to centralized DoD audit system
     console.log('[AUDIT]', entry)
   }
 
@@ -63,7 +55,7 @@ class AuditLogger {
     result: 'success' | 'failure',
     details: string = ''
   ): void {
-    this.log(userId, username, 'AUTHENTICATION', 'user', userId, details, 'SECRET', result)
+    this.log(userId, username, 'AUTHENTICATION', 'user', userId, details, result)
   }
 
   /**
@@ -74,19 +66,9 @@ class AuditLogger {
     username: string,
     resourceType: string,
     resourceId: string,
-    classification: ClassificationLevel,
     details: string = ''
   ): void {
-    this.log(
-      userId,
-      username,
-      'DATA_ACCESS',
-      resourceType,
-      resourceId,
-      details,
-      classification,
-      'success'
-    )
+    this.log(userId, username, 'DATA_ACCESS', resourceType, resourceId, details, 'success')
   }
 
   /**
@@ -97,19 +79,9 @@ class AuditLogger {
     username: string,
     resourceType: string,
     resourceId: string,
-    classification: ClassificationLevel,
     details: string = ''
   ): void {
-    this.log(
-      userId,
-      username,
-      'DATA_MODIFY',
-      resourceType,
-      resourceId,
-      details,
-      classification,
-      'success'
-    )
+    this.log(userId, username, 'DATA_MODIFY', resourceType, resourceId, details, 'success')
   }
 
   /**
@@ -122,32 +94,14 @@ class AuditLogger {
     resourceId: string,
     reason: string
   ): void {
-    this.log(
-      userId,
-      username,
-      'ACCESS_DENIED',
-      resourceType,
-      resourceId,
-      reason,
-      'SECRET',
-      'denied'
-    )
+    this.log(userId, username, 'ACCESS_DENIED', resourceType, resourceId, reason, 'denied')
   }
 
   /**
    * Log system configuration change
    */
   logConfigChange(userId: string, username: string, configItem: string, details: string): void {
-    this.log(
-      userId,
-      username,
-      'CONFIG_CHANGE',
-      'system_config',
-      configItem,
-      details,
-      'SECRET',
-      'success'
-    )
+    this.log(userId, username, 'CONFIG_CHANGE', 'system_config', configItem, details, 'success')
   }
 
   /**
@@ -158,7 +112,6 @@ class AuditLogger {
     username: string,
     resourceType: string,
     resourceId: string,
-    classification: ClassificationLevel,
     exportFormat: string
   ): void {
     this.log(
@@ -168,30 +121,6 @@ class AuditLogger {
       resourceType,
       resourceId,
       `Exported as ${exportFormat}`,
-      classification,
-      'success'
-    )
-  }
-
-  /**
-   * Log classification change (critical security event)
-   */
-  logClassificationChange(
-    userId: string,
-    username: string,
-    resourceId: string,
-    oldClassification: ClassificationLevel,
-    newClassification: ClassificationLevel,
-    justification: string
-  ): void {
-    this.log(
-      userId,
-      username,
-      'CLASSIFICATION_CHANGE',
-      'document',
-      resourceId,
-      `Changed from ${oldClassification} to ${newClassification}. Justification: ${justification}`,
-      'SECRET',
       'success'
     )
   }
@@ -238,7 +167,6 @@ class AuditLogger {
    */
   private getClientIP(): string {
     // In production, this would come from actual request headers
-    // For demo, return a mock IP
     return '10.0.1.100'
   }
 
@@ -255,7 +183,6 @@ class AuditLogger {
     accessDenials: number
     dataExports: number
     configChanges: number
-    classificationChanges: number
     uniqueUsers: Set<string>
   } {
     const logsInRange = this.getLogsByTimeRange(startDate, endDate)
@@ -269,7 +196,6 @@ class AuditLogger {
       accessDenials: logsInRange.filter(l => l.result === 'denied').length,
       dataExports: logsInRange.filter(l => l.action === 'DATA_EXPORT').length,
       configChanges: logsInRange.filter(l => l.action === 'CONFIG_CHANGE').length,
-      classificationChanges: logsInRange.filter(l => l.action === 'CLASSIFICATION_CHANGE').length,
       uniqueUsers: new Set(logsInRange.map(l => l.userId)),
     }
   }
@@ -283,15 +209,13 @@ export function logScenarioAccess(
   userId: string,
   username: string,
   scenarioId: string,
-  scenarioName: string,
-  classification: ClassificationLevel
+  scenarioName: string
 ): void {
   auditLogger.logDataAccess(
     userId,
     username,
     'scenario',
     scenarioId,
-    classification,
     `Accessed scenario: ${scenarioName}`
   )
 }
@@ -301,34 +225,14 @@ export function logManeuverPlanning(
   userId: string,
   username: string,
   satelliteId: string,
-  maneuverType: string,
-  classification: ClassificationLevel
+  maneuverType: string
 ): void {
   auditLogger.logDataModification(
     userId,
     username,
     'maneuver_plan',
     satelliteId,
-    classification,
     `Created ${maneuverType} maneuver plan`
-  )
-}
-
-// Helper function to log alert acknowledgment
-export function logAlertAcknowledgment(
-  userId: string,
-  username: string,
-  alertId: string,
-  alertTitle: string,
-  classification: ClassificationLevel
-): void {
-  auditLogger.logDataModification(
-    userId,
-    username,
-    'c2_alert',
-    alertId,
-    classification,
-    `Acknowledged alert: ${alertTitle}`
   )
 }
 

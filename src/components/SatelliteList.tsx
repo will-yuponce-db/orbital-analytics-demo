@@ -31,14 +31,18 @@ const SatelliteList: React.FC<SatelliteListProps> = ({ satellites, onToggleSatel
       sat.name.toLowerCase().includes(searchTerm.toLowerCase()) || sat.noradId.includes(searchTerm)
   )
 
+  // Selected objects (the event pair by default) are listed first.
   const groupedSatellites = {
-    active: filteredSatellites.filter(s => s.category === 'active'),
-    debris: filteredSatellites.filter(s => s.category === 'debris'),
-    'rocket-body': filteredSatellites.filter(s => s.category === 'rocket-body'),
+    selected: filteredSatellites.filter(s => s.selected),
+    active: filteredSatellites.filter(s => !s.selected && s.category === 'active'),
+    debris: filteredSatellites.filter(s => !s.selected && s.category === 'debris'),
+    'rocket-body': filteredSatellites.filter(s => !s.selected && s.category === 'rocket-body'),
   }
 
   const getCategoryLabel = (category: string) => {
     switch (category) {
+      case 'selected':
+        return 'Selected'
       case 'active':
         return 'Active Satellites'
       case 'debris':
@@ -52,6 +56,8 @@ const SatelliteList: React.FC<SatelliteListProps> = ({ satellites, onToggleSatel
 
   const getCategoryColor = (category: string) => {
     switch (category) {
+      case 'selected':
+        return 'primary'
       case 'active':
         return 'success'
       case 'debris':
@@ -69,7 +75,7 @@ const SatelliteList: React.FC<SatelliteListProps> = ({ satellites, onToggleSatel
         <TextField
           fullWidth
           size="small"
-          placeholder="Search satellites..."
+          placeholder="Search name or NORAD ID"
           value={searchTerm}
           onChange={e => setSearchTerm(e.target.value)}
           InputProps={{
@@ -124,13 +130,19 @@ const SatelliteList: React.FC<SatelliteListProps> = ({ satellites, onToggleSatel
                       </ListItem>
                       <Box sx={{ px: 2, py: 1, backgroundColor: 'background.default' }}>
                         <Typography variant="caption" color="text.secondary" component="div">
-                          Altitude: {satellite.altitude.toFixed(1)} km
+                          Altitude:{' '}
+                          {satellite.altitude != null ? satellite.altitude.toFixed(1) : '--'} km
                         </Typography>
                         <Typography variant="caption" color="text.secondary" component="div">
-                          Velocity: {satellite.velocity.toFixed(2)} km/s
+                          Velocity:{' '}
+                          {satellite.velocity != null ? satellite.velocity.toFixed(2) : '--'} km/s
                         </Typography>
                         <Typography variant="caption" color="text.secondary" component="div">
-                          Inclination: {satellite.orbitalParams.inclination.toFixed(2)}°
+                          Inclination:{' '}
+                          {satellite.orbitalParams?.inclination != null
+                            ? satellite.orbitalParams.inclination.toFixed(2)
+                            : '--'}
+                          °
                         </Typography>
                       </Box>
                       <Divider />

@@ -17,12 +17,31 @@ import {
   SkipPrevious as SkipPreviousIcon,
   Speed as SpeedIcon,
 } from '@mui/icons-material'
+import useNow from '../hooks/useNow'
+import { formatUtc } from '../utils/format'
+
+/** Playback rates in simulated seconds per real second. */
+const SPEEDS = [
+  { value: 10, label: '10\u00d7' },
+  { value: 60, label: '1 min/s' },
+  { value: 300, label: '5 min/s' },
+  { value: 900, label: '15 min/s' },
+  { value: 3600, label: '1 h/s' },
+]
+
+export interface TimelineMarker {
+  time: string // ISO timestamp
+  label: string
+  color: string // hex color
+  type: 'conjunction' | 'anomaly'
+}
 
 interface TimelineControlProps {
   startTime: string
   endTime: string
   currentTime: Date
   onTimeChange: (time: Date) => void
+  markers?: TimelineMarker[]
 }
 
 const TimelineControl: React.FC<TimelineControlProps> = ({
@@ -30,9 +49,11 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
   endTime,
   currentTime,
   onTimeChange,
+  markers = [],
 }) => {
   const [isPlaying, setIsPlaying] = useState(false)
-  const [speed, setSpeed] = useState(1)
+  const [speed, setSpeed] = useState(60)
+  const nowMs = useNow(10_000)
   const animationFrameRef = useRef<number>()
   const lastUpdateRef = useRef<number>(0)
   const currentTimeRef = useRef<Date>(currentTime)
@@ -62,7 +83,7 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
     if (isPlaying) {
       const animate = () => {
         const now = Date.now()
-        const deltaTime = (now - lastUpdateRef.current) * speed * 10 // Scale speed for better control
+        const deltaTime = (now - lastUpdateRef.current) * speed
         lastUpdateRef.current = now
 
         const newTime = new Date(currentTimeRef.current.getTime() + deltaTime)
@@ -91,27 +112,46 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
   }, [isPlaying, speed, startDate, endDate, onTimeChange])
 
   const handlePlayPause = () => {
+    // If at the end, restart from beginning before playing
+    if (!isPlaying && currentTime.getTime() >= endDate.getTime() - 1000) {
+      onTimeChange(startDate)
+      currentTimeRef.current = startDate
+    }
     setIsPlaying(!isPlaying)
   }
 
+  // Sort markers by time for event-based navigation
+  const sortedMarkerTimes = useMemo(
+    () =>
+      markers
+        .map(m => new Date(m.time).getTime())
+        .filter(t => t >= startDate.getTime() && t <= endDate.getTime())
+        .sort((a, b) => a - b),
+    [markers, startDate, endDate]
+  )
+
   const handlePreviousEvent = () => {
-    // Jump back 1 minute
-    const newTime = new Date(currentTime.getTime() - 60000)
-    if (newTime.getTime() < startDate.getTime()) {
-      onTimeChange(startDate)
+    // Jump to previous event marker, or back 1 minute if no markers
+    const now = currentTime.getTime()
+    const prev = sortedMarkerTimes.filter(t => t < now - 1000).pop()
+    if (prev !== undefined) {
+      onTimeChange(new Date(prev))
     } else {
-      onTimeChange(newTime)
+      const newTime = new Date(now - 60000)
+      onTimeChange(newTime.getTime() < startDate.getTime() ? startDate : newTime)
     }
     setIsPlaying(false)
   }
 
   const handleNextEvent = () => {
-    // Jump forward 1 minute
-    const newTime = new Date(currentTime.getTime() + 60000)
-    if (newTime.getTime() > endDate.getTime()) {
-      onTimeChange(endDate)
+    // Jump to next event marker, or forward 1 minute if no markers
+    const now = currentTime.getTime()
+    const next = sortedMarkerTimes.find(t => t > now + 1000)
+    if (next !== undefined) {
+      onTimeChange(new Date(next))
     } else {
-      onTimeChange(newTime)
+      const newTime = new Date(now + 60000)
+      onTimeChange(newTime.getTime() > endDate.getTime() ? endDate : newTime)
     }
     setIsPlaying(false)
   }
@@ -124,14 +164,7 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
     onTimeChange(newTime)
   }
 
-  const formatTime = (time: string | Date) => {
-    const date = typeof time === 'string' ? new Date(time) : time
-    return date.toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    })
-  }
+  const formatTime = (time: string | Date) => formatUtc(time, { seconds: true })
 
   return (
     <Paper
@@ -146,7 +179,7 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
         {/* Playback controls */}
         <Box sx={{ display: 'flex', gap: 1 }}>
-          <Tooltip title="Previous event (1 min back)">
+          <Tooltip title="Previous event">
             <IconButton size="small" onClick={handlePreviousEvent}>
               <SkipPreviousIcon />
             </IconButton>
@@ -156,7 +189,7 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
               {isPlaying ? <PauseIcon /> : <PlayIcon />}
             </IconButton>
           </Tooltip>
-          <Tooltip title="Next event (1 min forward)">
+          <Tooltip title="Next event">
             <IconButton size="small" onClick={handleNextEvent}>
               <SkipNextIcon />
             </IconButton>
@@ -164,13 +197,106 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
         </Box>
 
         {/* Timeline slider */}
-        <Box sx={{ flexGrow: 1, px: 2 }}>
+        <Box sx={{ flexGrow: 1, px: 2, position: 'relative' }}>
+          {/* Event markers */}
+          {markers.map((marker, idx) => {
+            const markerTime = new Date(marker.time).getTime()
+            const pct = ((markerTime - startDate.getTime()) / totalDuration) * 100
+            if (pct < 0 || pct > 100) return null
+            return (
+              <Tooltip key={idx} title={`${marker.label}`} placement="top" arrow>
+                <Box
+                  onMouseDown={(e: React.MouseEvent) => {
+                    e.stopPropagation()
+                    e.preventDefault()
+                    setIsPlaying(false)
+                    onTimeChange(new Date(marker.time))
+                  }}
+                  onClick={(e: React.MouseEvent) => {
+                    e.stopPropagation()
+                    e.preventDefault()
+                  }}
+                  sx={{
+                    position: 'absolute',
+                    left: `${pct}%`,
+                    top: 2,
+                    transform: 'translateX(-50%)',
+                    width: 10,
+                    height: 10,
+                    borderRadius: '50%',
+                    bgcolor: marker.color,
+                    border: '1.5px solid rgba(0,0,0,0.6)',
+                    cursor: 'pointer',
+                    zIndex: 10,
+                    transition: 'transform 0.15s',
+                    '&:hover': {
+                      transform: 'translateX(-50%) scale(1.6)',
+                      boxShadow: `0 0 8px ${marker.color}`,
+                    },
+                  }}
+                />
+              </Tooltip>
+            )
+          })}
+          {/* "Now" marker line */}
+          {(() => {
+            const nowPct = ((nowMs - startDate.getTime()) / totalDuration) * 100
+            if (nowPct < 0 || nowPct > 100) return null
+            return (
+              <Tooltip title="Now" placement="top">
+                <Box
+                  sx={{
+                    position: 'absolute',
+                    left: `${nowPct}%`,
+                    top: 0,
+                    bottom: 0,
+                    width: 2,
+                    bgcolor: 'rgba(255,255,255,0.4)',
+                    zIndex: 5,
+                    pointerEvents: 'none',
+                    '&::after': {
+                      content: '"NOW"',
+                      position: 'absolute',
+                      top: -14,
+                      left: '50%',
+                      transform: 'translateX(-50%)',
+                      fontSize: '0.5rem',
+                      fontWeight: 700,
+                      color: 'rgba(255,255,255,0.5)',
+                      letterSpacing: 1,
+                    },
+                  }}
+                />
+              </Tooltip>
+            )
+          })()}
           <Slider
             value={sliderValue}
             onChange={handleSliderChange}
             sx={{
               '& .MuiSlider-markLabel': {
                 fontSize: '0.7rem',
+              },
+              // Color the track: past portion is dimmer, future is brighter
+              '& .MuiSlider-track': {
+                background: (() => {
+                  const nowPct = ((nowMs - startDate.getTime()) / totalDuration) * 100
+                  const clampedNow = Math.max(0, Math.min(100, nowPct))
+                  // track goes from 0 to sliderValue
+                  if (sliderValue <= 0) return '#1976d2'
+                  const nowRatio = (clampedNow / sliderValue) * 100
+                  if (nowRatio >= 100) return '#1976d2' // all past
+                  if (nowRatio <= 0) return '#ff9800' // all future
+                  return `linear-gradient(90deg, #1976d2 ${nowRatio}%, #ff9800 ${nowRatio}%)`
+                })(),
+              },
+              '& .MuiSlider-rail': {
+                background: (() => {
+                  const nowPct = ((nowMs - startDate.getTime()) / totalDuration) * 100
+                  const clampedNow = Math.max(0, Math.min(100, nowPct))
+                  return `linear-gradient(90deg, rgba(255,255,255,0.15) ${clampedNow}%, rgba(255,152,0,0.15) ${clampedNow}%)`
+                })(),
+                opacity: 1,
               },
             }}
           />
@@ -193,15 +319,15 @@ const TimelineControl: React.FC<TimelineControlProps> = ({
           <FormControl size="small" sx={{ minWidth: 80 }}>
             <Select
               value={speed}
-              onChange={e => setSpeed(e.target.value as number)}
+              onChange={e => setSpeed(Number(e.target.value))}
               sx={{ fontSize: '0.875rem' }}
+              inputProps={{ 'aria-label': 'Playback speed' }}
             >
-              <MenuItem value={0.25}>0.25x</MenuItem>
-              <MenuItem value={0.5}>0.5x</MenuItem>
-              <MenuItem value={1}>1x</MenuItem>
-              <MenuItem value={2}>2x</MenuItem>
-              <MenuItem value={5}>5x</MenuItem>
-              <MenuItem value={10}>10x</MenuItem>
+              {SPEEDS.map(o => (
+                <MenuItem key={o.value} value={o.value}>
+                  {o.label}
+                </MenuItem>
+              ))}
             </Select>
           </FormControl>
         </Box>

@@ -5,7 +5,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current working directory.
   const env = loadEnv(mode, process.cwd(), '')
-  
+
   // Map Databricks environment variables to VITE_ prefixed ones for client access
   const databricksEnv = {
     VITE_APP_NAME: env.DATABRICKS_APP_NAME || 'orbital-analytics-demo',
@@ -24,7 +24,9 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_APP_URL': JSON.stringify(databricksEnv.VITE_APP_URL),
       'import.meta.env.VITE_PORT': JSON.stringify(databricksEnv.VITE_PORT),
       'import.meta.env.VITE_DATABRICKS_HOST': JSON.stringify(databricksEnv.VITE_DATABRICKS_HOST),
-      'import.meta.env.VITE_DATABRICKS_WORKSPACE_ID': JSON.stringify(databricksEnv.VITE_DATABRICKS_WORKSPACE_ID),
+      'import.meta.env.VITE_DATABRICKS_WORKSPACE_ID': JSON.stringify(
+        databricksEnv.VITE_DATABRICKS_WORKSPACE_ID
+      ),
     },
     build: {
       // Production optimizations
@@ -34,9 +36,16 @@ export default defineConfig(({ mode }) => {
         output: {
           manualChunks: {
             // Split vendor chunks for better caching
-            'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-            'mui-vendor': ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
+            // react-dom/client is listed so it does not land in three-vendor (fiber imports it too).
+            'react-vendor': ['react', 'react-dom', 'react-dom/client', 'react-router-dom'],
+            'mui-vendor': [
+              '@mui/material',
+              '@mui/icons-material',
+              '@emotion/react',
+              '@emotion/styled',
+            ],
             'three-vendor': ['three', '@react-three/fiber', '@react-three/drei'],
+            'charts-vendor': ['recharts'],
           },
         },
       },
@@ -47,6 +56,11 @@ export default defineConfig(({ mode }) => {
     server: {
       port: parseInt(env.PORT || '3000', 10),
       host: env.UVICORN_HOST || '0.0.0.0',
+      // `npm run dev`: the client calls relative /api paths; forward them to the
+      // Express server (default port 3001, override with API_PROXY_TARGET).
+      proxy: {
+        '/api': env.API_PROXY_TARGET || 'http://localhost:3001',
+      },
     },
     preview: {
       port: parseInt(env.PORT || '3000', 10),
@@ -54,4 +68,3 @@ export default defineConfig(({ mode }) => {
     },
   }
 })
-

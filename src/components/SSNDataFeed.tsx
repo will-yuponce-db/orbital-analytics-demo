@@ -82,7 +82,7 @@ const SSNDataFeed: React.FC<SSNDataFeedProps> = ({ sources }) => {
             <Typography variant="h6">SSN Data Feeds</Typography>
           </Stack>
           <Typography variant="caption" color="text.secondary">
-            Space Surveillance Network - Real-time Sensor Status
+            Reference sensor list: static context, not a live feed
           </Typography>
         </Box>
 
@@ -251,7 +251,7 @@ const SSNDataFeed: React.FC<SSNDataFeedProps> = ({ sources }) => {
           </List>
         </Box>
 
-        {/* JSpOC Integration Notice */}
+        {/* Reference data notice */}
         <Paper
           variant="outlined"
           sx={{
@@ -264,29 +264,12 @@ const SSNDataFeed: React.FC<SSNDataFeedProps> = ({ sources }) => {
         >
           <Stack spacing={1}>
             <Typography variant="body2" fontWeight="bold">
-              🛡️ JSpOC/18 SPCS Integration
+              Reference data
             </Typography>
             <Typography variant="caption">
-              Connected to Joint Space Operations Center (JSpOC) and 18th Space Control Squadron.
-              Real-time data feed from Space Fence, GEODSS, and PAVE PAWS radar systems.
+              Sensor sites listed for context only. OrbitWatch does not ingest sensor observations;
+              conjunction data comes from Space-Track CDMs.
             </Typography>
-            <Stack direction="row" spacing={1}>
-              <Chip
-                label="ENCRYPTED"
-                size="small"
-                sx={{ bgcolor: 'success.dark', color: 'white', fontSize: '0.7rem', height: 20 }}
-              />
-              <Chip
-                label="LOW LATENCY"
-                size="small"
-                sx={{ bgcolor: 'info.dark', color: 'white', fontSize: '0.7rem', height: 20 }}
-              />
-              <Chip
-                label="CDM ENABLED"
-                size="small"
-                sx={{ bgcolor: 'warning.dark', color: 'white', fontSize: '0.7rem', height: 20 }}
-              />
-            </Stack>
           </Stack>
         </Paper>
       </Stack>

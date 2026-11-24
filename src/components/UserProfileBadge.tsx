@@ -9,13 +9,9 @@ import {
   Chip,
   Divider,
   IconButton,
-  List,
-  ListItem,
-  ListItemText,
 } from '@mui/material'
 import {
   Person as PersonIcon,
-  Security as SecurityIcon,
   AdminPanelSettings as AdminIcon,
   Engineering as EngineerIcon,
   Assessment as AnalystIcon,
@@ -75,19 +71,6 @@ const UserProfileBadge: React.FC<UserProfileBadgeProps> = ({ user }) => {
     }
   }
 
-  const getClearanceColor = (level: string): string => {
-    switch (level) {
-      case 'TOP SECRET':
-        return '#FF8C00'
-      case 'SECRET':
-        return '#C8102E'
-      case 'CONFIDENTIAL':
-        return '#0033A0'
-      default:
-        return '#007A33'
-    }
-  }
-
   const getInitials = (username: string): string => {
     const parts = username.split('.')
     if (parts.length >= 2) {
@@ -117,7 +100,7 @@ const UserProfileBadge: React.FC<UserProfileBadgeProps> = ({ user }) => {
             fontSize: '0.9rem',
             fontWeight: 'bold',
             border: '2px solid',
-            borderColor: getClearanceColor(user.clearanceLevel),
+            borderColor: 'primary.main',
           }}
         >
           {getInitials(user.username)}
@@ -137,7 +120,7 @@ const UserProfileBadge: React.FC<UserProfileBadgeProps> = ({ user }) => {
           horizontal: 'right',
         }}
       >
-        <Paper sx={{ width: 320, p: 2 }}>
+        <Paper sx={{ width: 280, p: 2 }}>
           <Stack spacing={2}>
             {/* Header */}
             <Box display="flex" alignItems="center" gap={2}>
@@ -149,93 +132,41 @@ const UserProfileBadge: React.FC<UserProfileBadgeProps> = ({ user }) => {
                   fontSize: '1.2rem',
                   fontWeight: 'bold',
                   border: '3px solid',
-                  borderColor: getClearanceColor(user.clearanceLevel),
+                  borderColor: 'primary.main',
                 }}
               >
                 {getInitials(user.username)}
               </Avatar>
               <Box flex={1}>
                 <Typography variant="body1" fontWeight="bold">
-                  {user.rank ? `${user.rank} ` : ''}
                   {user.username.replace('.', ' ').toUpperCase()}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  {user.unit}
+                  {user.organization}
                 </Typography>
               </Box>
             </Box>
 
             <Divider />
 
-            {/* Role & Clearance */}
+            {/* Role */}
             <Box>
               <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
                 {getRoleIcon(user.role)}
                 <Typography variant="body2" fontWeight="bold">
-                  Role & Access
+                  Role
                 </Typography>
               </Stack>
-              <Stack spacing={1}>
-                <Chip
-                  label={user.role.toUpperCase().replace(/-/g, ' ')}
-                  size="small"
-                  sx={{
-                    bgcolor: getRoleColor(user.role),
-                    color: 'white',
-                    fontWeight: 'bold',
-                  }}
-                />
-                <Chip
-                  icon={<SecurityIcon />}
-                  label={`${user.clearanceLevel} CLEARANCE`}
-                  size="small"
-                  sx={{
-                    bgcolor: getClearanceColor(user.clearanceLevel),
-                    color: 'white',
-                    fontWeight: 'bold',
-                  }}
-                />
-              </Stack>
+              <Chip
+                label={user.role.toUpperCase().replace(/-/g, ' ')}
+                size="small"
+                sx={{
+                  bgcolor: getRoleColor(user.role),
+                  color: 'white',
+                  fontWeight: 'bold',
+                }}
+              />
             </Box>
-
-            {/* SCI Access */}
-            {user.sciAccess.length > 0 && (
-              <Box>
-                <Typography variant="caption" color="text.secondary" fontWeight="bold" gutterBottom>
-                  SCI COMPARTMENTS
-                </Typography>
-                <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
-                  {user.sciAccess.map(sci => (
-                    <Chip
-                      key={sci}
-                      label={sci}
-                      size="small"
-                      variant="outlined"
-                      sx={{ fontSize: '0.7rem', height: 22 }}
-                    />
-                  ))}
-                </Stack>
-              </Box>
-            )}
-
-            {/* Need to Know */}
-            {user.needToKnow.length > 0 && (
-              <Box>
-                <Typography variant="caption" color="text.secondary" fontWeight="bold" gutterBottom>
-                  NEED TO KNOW AREAS
-                </Typography>
-                <List dense sx={{ p: 0 }}>
-                  {user.needToKnow.map((area, idx) => (
-                    <ListItem key={idx} sx={{ px: 0 }}>
-                      <ListItemText
-                        primary={area}
-                        primaryTypographyProps={{ variant: 'caption' }}
-                      />
-                    </ListItem>
-                  ))}
-                </List>
-              </Box>
-            )}
 
             <Divider />
 
@@ -248,25 +179,6 @@ const UserProfileBadge: React.FC<UserProfileBadgeProps> = ({ user }) => {
                 User ID: {user.id}
               </Typography>
             </Box>
-
-            {/* Security Notice */}
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 1,
-                bgcolor: 'warning.dark',
-                color: 'white',
-                border: '1px solid',
-                borderColor: 'warning.main',
-              }}
-            >
-              <Typography variant="caption" fontWeight="bold">
-                ⚠️ SECURITY NOTICE
-              </Typography>
-              <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
-                All actions are logged and audited. Unauthorized access or disclosure is prohibited.
-              </Typography>
-            </Paper>
           </Stack>
         </Paper>
       </Popover>

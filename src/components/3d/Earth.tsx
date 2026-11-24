@@ -1,6 +1,7 @@
 import React, { useRef, useMemo, Suspense, useEffect } from 'react'
 import { useLoader } from '@react-three/fiber'
 import { TextureLoader, Mesh, ShaderMaterial, BackSide } from 'three'
+import * as satellite from 'satellite.js'
 import { getEarthRadius } from '../../utils/orbitalCalculations'
 
 interface EarthContentProps {
@@ -21,19 +22,16 @@ const EarthContent: React.FC<EarthContentProps> = ({ currentTime }) => {
     'https://unpkg.com/three-globe@2.31.1/example/img/earth-topology.png',
   ])
 
-  // Earth rotation synced to timeline
-  // Earth rotates once every 24 hours (86400000 milliseconds)
+  // Earth rotation synced to timeline using Greenwich Mean Sidereal Time (GMST)
+  // This ensures the globe texture aligns with ECI coordinates from SGP4
   useEffect(() => {
+    const gmst = satellite.gstime(currentTime)
     if (meshRef.current) {
-      const millisecondsSinceMidnight = currentTime.getTime() % 86400000
-      const rotationAngle = (millisecondsSinceMidnight / 86400000) * Math.PI * 2
-      meshRef.current.rotation.y = rotationAngle
+      meshRef.current.rotation.y = gmst
     }
     if (cloudsRef.current) {
-      const millisecondsSinceMidnight = currentTime.getTime() % 86400000
-      // Clouds rotate slightly faster
-      const rotationAngle = (millisecondsSinceMidnight / 86400000) * Math.PI * 2 * 1.2
-      cloudsRef.current.rotation.y = rotationAngle
+      // Clouds rotate slightly offset from Earth
+      cloudsRef.current.rotation.y = gmst * 1.02
     }
   }, [currentTime])
 
@@ -142,17 +140,13 @@ const FallbackEarth: React.FC<EarthContentProps> = ({ currentTime }) => {
   const cloudsRef = useRef<Mesh>(null)
   const earthRadius = getEarthRadius()
 
-  // Earth rotation synced to timeline
   useEffect(() => {
+    const gmst = satellite.gstime(currentTime)
     if (meshRef.current) {
-      const millisecondsSinceMidnight = currentTime.getTime() % 86400000
-      const rotationAngle = (millisecondsSinceMidnight / 86400000) * Math.PI * 2
-      meshRef.current.rotation.y = rotationAngle
+      meshRef.current.rotation.y = gmst
     }
     if (cloudsRef.current) {
-      const millisecondsSinceMidnight = currentTime.getTime() % 86400000
-      const rotationAngle = (millisecondsSinceMidnight / 86400000) * Math.PI * 2 * 1.2
-      cloudsRef.current.rotation.y = rotationAngle
+      cloudsRef.current.rotation.y = gmst * 1.02
     }
   }, [currentTime])
 

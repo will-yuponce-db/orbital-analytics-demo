@@ -2,7 +2,7 @@
  * Utility functions for managing recently viewed scenarios
  */
 
-const RECENTLY_VIEWED_KEY = 'ussf-sda-recently-viewed'
+const RECENTLY_VIEWED_KEY = 'orbitwatch-recently-viewed'
 const MAX_RECENT_ITEMS = 5
 
 export interface RecentlyViewedItem {
@@ -18,7 +18,8 @@ export const getRecentlyViewed = (): RecentlyViewedItem[] => {
   try {
     const stored = localStorage.getItem(RECENTLY_VIEWED_KEY)
     if (!stored) return []
-    return JSON.parse(stored)
+    const parsed = JSON.parse(stored) as RecentlyViewedItem[]
+    return parsed.filter(item => item.scenarioName && !item.scenarioName.includes('undefined'))
   } catch (error) {
     console.error('Error reading recently viewed:', error)
     return []
@@ -74,7 +75,3 @@ export const getRelativeTime = (timestamp: number): string => {
   if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`
   return `${days} day${days > 1 ? 's' : ''} ago`
 }
-
-
-
-

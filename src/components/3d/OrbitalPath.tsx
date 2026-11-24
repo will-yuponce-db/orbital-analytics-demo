@@ -2,29 +2,45 @@ import React, { useMemo } from 'react'
 import { Line } from '@react-three/drei'
 import { Satellite } from '../../types'
 import { calculateOrbitPath } from '../../utils/orbitalCalculations'
+import { periodMs, satrecFor, scenePosition } from '../../utils/satrec'
 
 interface OrbitalPathProps {
   satellite: Satellite
   visible?: boolean
   isPredicted?: boolean
+  currentTime?: Date
 }
 
 const OrbitalPath: React.FC<OrbitalPathProps> = ({
-  satellite,
+  satellite: s,
   visible = true,
   isPredicted = false,
+  currentTime,
 }) => {
-  // Calculate orbital path points
-  const points = useMemo(() => {
-    return calculateOrbitPath(satellite.orbitalParams, 128)
-  }, [satellite.orbitalParams])
+  const shown = visible && (s.selected || isPredicted)
 
-  // Color based on satellite category or predicted status
-  const color = useMemo(() => {
-    if (isPredicted) {
-      return '#00d9ff' // Cyan for predicted paths
+  // One full orbit centered on the current time: SGP4 when a TLE is available,
+  // Keplerian elements otherwise. Skipped entirely for hidden objects.
+  const points = useMemo(() => {
+    if (!shown) return []
+    const rec = satrecFor(s.tle)
+    if (rec && currentTime) {
+      const period = periodMs(rec)
+      const segments = 128
+      const pts: Array<{ x: number; y: number; z: number }> = []
+      for (let i = 0; i <= segments; i++) {
+        const t = new Date(currentTime.getTime() - period / 2 + (i / segments) * period)
+        const pos = scenePosition(rec, t)
+        if (pos) pts.push({ x: pos[0], y: pos[1], z: pos[2] })
+      }
+      if (pts.length > 10) return pts
     }
-    switch (satellite.category) {
+    return calculateOrbitPath(s.orbitalParams, 128).map(v => ({ x: v.x, y: v.y, z: v.z }))
+  }, [shown, s.orbitalParams, s.tle, currentTime])
+
+  const color = useMemo(() => {
+    if (isPredicted) return '#00d9ff'
+    switch (s.category) {
       case 'active':
         return '#4ade80'
       case 'debris':
@@ -34,13 +50,10 @@ const OrbitalPath: React.FC<OrbitalPathProps> = ({
       default:
         return '#888888'
     }
-  }, [satellite.category, isPredicted])
+  }, [s.category, isPredicted])
 
-  if (!visible || (!satellite.selected && !isPredicted)) {
-    return null
-  }
+  if (!shown || points.length === 0) return null
 
-  // For predicted paths, render with dashed line
   if (isPredicted) {
     return (
       <line>
@@ -66,11 +79,11 @@ const OrbitalPath: React.FC<OrbitalPathProps> = ({
 
   return (
     <Line
-      points={points}
+      points={points.map(p => [p.x, p.y, p.z] as [number, number, number])}
       color={color}
-      lineWidth={satellite.selected ? 2 : 1}
+      lineWidth={s.selected ? 2 : 1}
       transparent
-      opacity={satellite.selected ? 0.6 : 0.3}
+      opacity={s.selected ? 0.6 : 0.3}
     />
   )
 }

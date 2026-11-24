@@ -20,12 +20,20 @@ export interface Satellite {
   altitude: number // km
   velocity: number // km/s
   selected: boolean
+  tle?: { line1: string; line2: string } | null
 }
 
 export interface AIRecommendation {
   id: string
   timestamp: string
-  type: 'maneuver' | 'monitoring' | 'collision-avoidance' | 'analysis'
+  type:
+    | 'collision-avoidance'
+    | 'conjunction-monitoring'
+    | 'orbital-adjustment'
+    | 're-entry-watch'
+    | 'maneuver'
+    | 'monitoring'
+    | 'analysis'
   priority: 'low' | 'medium' | 'high' | 'critical'
   description: string
   confidence: number // 0-100
@@ -106,27 +114,6 @@ export interface ScenarioVariant extends Scenario {
   maneuverApplied?: ManeuverPlan
 }
 
-// ============================================================================
-// SPACE FORCE OPERATIONAL EXTENSIONS
-// ============================================================================
-
-/**
- * Classification Levels per DoD 5220.22-M
- */
-export type ClassificationLevel = 'UNCLASSIFIED' | 'CONFIDENTIAL' | 'SECRET' | 'TOP SECRET'
-
-/**
- * Classification Markings
- */
-export interface ClassificationMarking {
-  level: ClassificationLevel
-  caveats?: string[] // e.g., ['NOFORN', 'RELIDO', 'FOUO']
-  sciControls?: string[] // SCI compartments
-  disseminationControls?: string[]
-  derivedFrom?: string
-  declassifyOn?: string
-}
-
 /**
  * User Roles for Role-Based Access Control
  */
@@ -139,93 +126,18 @@ export type UserRole =
   | 'coalition-partner'
 
 /**
- * User Clearance and Access
+ * User Profile
  */
 export interface UserProfile {
   id: string
   username: string
-  rank?: string
-  unit: string
   role: UserRole
-  clearanceLevel: ClassificationLevel
-  sciAccess: string[]
+  organization: string
   lastLogin: string
-  needToKnow: string[] // Mission areas
 }
 
 /**
- * Threat Assessment Types
- */
-export type ThreatType =
-  | 'hostile-satellite'
-  | 'asat-weapon'
-  | 'electronic-attack'
-  | 'cyber-attack'
-  | 'directed-energy'
-  | 'kinetic-intercept'
-  | 'co-orbital-threat'
-  | 'unknown'
-
-/**
- * Threat Level Assessment
- */
-export type ThreatLevel = 'none' | 'low' | 'moderate' | 'high' | 'critical'
-
-/**
- * Hostile Satellite/Object Tracking
- */
-export interface ThreatObject extends Satellite {
-  threatType: ThreatType
-  threatLevel: ThreatLevel
-  countryOfOrigin: string
-  firstDetected: string
-  behaviorProfile: 'aggressive' | 'surveillance' | 'proximity-ops' | 'unknown'
-  maneuverHistory: ManeuverEvent[]
-  capabilities?: ThreatCapability[]
-  targetedAssets?: string[] // IDs of threatened satellites
-}
-
-/**
- * Threat Capabilities
- */
-export interface ThreatCapability {
-  type: 'kinetic' | 'electronic' | 'directed-energy' | 'cyber' | 'proximity-ops'
-  detectionConfidence: number // 0-100
-  effectiveRange?: number // km
-  lastObserved: string
-}
-
-/**
- * Maneuver Event History
- */
-export interface ManeuverEvent {
-  timestamp: string
-  deltaV: number // m/s
-  description: string
-  assessed: 'hostile' | 'evasive' | 'routine' | 'unknown'
-}
-
-/**
- * Electronic Warfare Threat
- */
-export interface EWThreat {
-  id: string
-  type: 'jamming' | 'spoofing' | 'interference' | 'signal-intercept'
-  affectedFrequencies: string[] // GHz ranges
-  affectedSatellites: string[]
-  sourceLocation?: {
-    latitude: number
-    longitude: number
-    groundStation?: string
-  }
-  startTime: string
-  endTime?: string
-  severity: ThreatLevel
-  classification: ClassificationMarking
-}
-
-/**
- * Space Surveillance Network (SSN) Data Source
+ * Tracking Network Data Source
  */
 export interface SSNDataSource {
   sensorId: string
@@ -238,21 +150,58 @@ export interface SSNDataSource {
 }
 
 /**
- * Command and Control Alert
+ * Conjunction Event
  */
-export interface C2Alert {
+export interface ConjunctionEvent {
   id: string
-  timestamp: string
-  alertType: 'conjunction' | 'threat-detection' | 'anomaly' | 'ew-attack' | 'maneuver-required'
-  priority: 'routine' | 'priority' | 'immediate' | 'flash'
-  title: string
+  cdmId?: string
+  satelliteA: { id: string; name: string; noradId: string; operator?: string }
+  satelliteB: { id: string; name: string; noradId: string; operator?: string }
+  tca: string
+  missDistanceKm: number
+  rawPc?: number
+  mlPc: number
+  riskTier: 'green' | 'amber' | 'red'
+  maneuverRecommended: boolean
+  maneuverWindowOpen?: string
+  maneuverWindowClose?: string
+  status: 'active' | 'resolved' | 'maneuvered' | 'passed'
+  /** Miss distance in meters (newer API rows). */
+  missDistanceM?: number | null
+  /** Hours from now to TCA; negative once passed. */
+  hoursToTca?: number | null
+  /** Stable key for the physical event across CDM updates and object orderings. */
+  eventKey?: string | null
+  /** Number of CDMs folded into this event. */
+  cdmCount?: number | null
+  firstPc?: number | null
+  maxPc?: number | null
+  pcHistory?: { createdAt: string | null; pc: number | null; missDistanceM: number | null }[] | null
+}
+
+/**
+ * Anomaly Detection Event (IsolationForest ML output)
+ */
+export interface AnomalyEvent {
+  id: number
+  noradId: string
+  satelliteName: string
+  anomalyType:
+    | 'altitude-drop'
+    | 'velocity-spike'
+    | 'eccentricity-change'
+    | 'inclination-drift'
+    | 'orbital-decay'
+    | 'maneuver-unplanned'
+  severity: 'low' | 'medium' | 'high' | 'critical'
+  detectedAt: string
+  parameterName: string
+  expectedValue: number
+  observedValue: number
+  deviationSigma: number
+  anomalyScore: number
   description: string
-  affectedAssets: string[]
-  recommendedActions: string[]
-  disseminationList: string[] // Units/commands to notify
-  classification: ClassificationMarking
-  acknowledgedBy?: string[]
-  resolvedAt?: string
+  status: 'active' | 'investigating' | 'resolved'
 }
 
 /**
@@ -268,7 +217,6 @@ export interface AuditLogEntry {
   resourceId: string
   details: string
   ipAddress: string
-  classification: ClassificationLevel
   result: 'success' | 'failure' | 'denied'
 }
 

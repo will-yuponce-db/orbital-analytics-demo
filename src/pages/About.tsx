@@ -1,194 +1,241 @@
 import React from 'react'
+import { Box, Chip, Container, Grid, Paper, Stack, Typography } from '@mui/material'
 import {
-  Typography,
-  Container,
-  Paper,
-  Box,
-  List,
-  ListItem,
-  ListItemIcon,
-  ListItemText,
-  Divider,
-  Stack,
-} from '@mui/material'
-import {
-  Satellite as SatelliteIcon,
-  CheckCircle as CheckCircleIcon,
-  Security as SecurityIcon,
+  SatelliteAlt as SatelliteIcon,
+  Verified as RealIcon,
+  Science as SimulatedIcon,
+  Psychology as ModelIcon,
+  Keyboard as KeyboardIcon,
+  Rule as LimitsIcon,
 } from '@mui/icons-material'
+import { TIER_COLOR } from '../utils/riskStyle'
 
-const About: React.FC = () => {
-  const features = [
-    'Scenario-based orbital analysis workflow',
-    '3D visualization of satellite orbits and trajectories',
-    'AI-powered digital twin recommendations',
-    'Real-time telemetry and metrics monitoring',
-    'Multi-satellite tracking and conjunction analysis',
-    'Support for testing, training, and operational data',
-  ]
+const DEFINITIONS: { term: string; text: React.ReactNode }[] = [
+  {
+    term: 'TCA',
+    text: 'Time of closest approach, from the latest CDM for the event. All times are UTC.',
+  },
+  { term: 'Miss distance', text: 'Predicted minimum range between the two objects at TCA.' },
+  {
+    term: 'Pc (18 SDS)',
+    text: 'Probability of collision reported in the CDM by the 18th Space Defense Squadron. OrbitWatch does not recompute it; risk tiers and maneuver advice use this value.',
+  },
+  {
+    term: 'Pc (ML)',
+    text: 'An XGBoost estimate of Pc from encounter and object features, trained on CDM history. Shown for comparison, never as a replacement.',
+  },
+  {
+    term: 'CDM updates',
+    text: 'Space-Track issues several CDMs per event as the orbit solutions improve, in both object orderings. Each card is one event; its Pc trend runs from the first CDM to the latest.',
+  },
+  {
+    term: 'Risk tier',
+    text: (
+      <>
+        <Box component="span" sx={{ color: TIER_COLOR.red, fontWeight: 700 }}>
+          Red
+        </Box>{' '}
+        above 1×10⁻³,{' '}
+        <Box component="span" sx={{ color: TIER_COLOR.amber, fontWeight: 700 }}>
+          amber
+        </Box>{' '}
+        1×10⁻⁴ to 1×10⁻³,{' '}
+        <Box component="span" sx={{ color: TIER_COLOR.green, fontWeight: 700 }}>
+          green
+        </Box>{' '}
+        below 1×10⁻⁴, on the 18 SDS Pc.
+      </>
+    ),
+  },
+  {
+    term: 'Maneuver window',
+    text: 'For events above 1×10⁻⁴: from TCA minus 48 h to TCA minus 6 h. After TCA, or once the window closes, no maneuver advice is shown.',
+  },
+]
 
-  const technologies = [
-    'React 18 with TypeScript - Type-safe UI development',
-    'Vite - Lightning-fast build tooling',
-    'Material-UI (MUI) - Comprehensive component library',
-    'React Router - Client-side navigation',
-    'Dark space theme optimized for data visualization',
-  ]
+const SHORTCUTS: [string, string][] = [
+  ['⌘K / Ctrl+K', 'Search the scenario library'],
+  ['M', 'Orbital elements'],
+  ['A', 'AI analyst'],
+  ['C', 'Conjunction list'],
+  ['X', 'Anomalies'],
+  ['T', 'Event playback'],
+]
 
-  return (
-    <Container maxWidth="lg">
-      <Box sx={{ my: 4 }}>
-        <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 2 }}>
-          <SatelliteIcon sx={{ fontSize: 48, color: 'primary.main' }} />
-          <Box>
-            <Typography variant="h3" component="h1" fontWeight={600}>
-              Orbital Analysis Platform
-            </Typography>
-            <Typography variant="h6" color="text.secondary">
-              Space Domain Awareness & AI Digital Twins
-            </Typography>
-          </Box>
-        </Stack>
+const Section: React.FC<{ icon: React.ReactNode; title: string; children: React.ReactNode }> = ({
+  icon,
+  title,
+  children,
+}) => (
+  <Paper elevation={1} sx={{ p: 3, height: '100%', border: '1px solid rgba(255,255,255,0.08)' }}>
+    <Stack direction="row" spacing={1} alignItems="center" mb={1.5} sx={{ color: 'primary.light' }}>
+      {icon}
+      <Typography variant="h6" fontWeight={700} color="text.primary">
+        {title}
+      </Typography>
+    </Stack>
+    {children}
+  </Paper>
+)
 
-        <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-          <Typography variant="h5" gutterBottom fontWeight={600}>
-            Overview
+const About: React.FC = () => (
+  <Container maxWidth="lg">
+    <Box sx={{ my: 4 }}>
+      <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
+        <SatelliteIcon sx={{ fontSize: 44, color: 'primary.light' }} />
+        <Box>
+          <Typography variant="h4" component="h1" fontWeight={700}>
+            About OrbitWatch
           </Typography>
-          <Typography variant="body1" paragraph>
-            The Orbital Analysis Platform is a comprehensive tool designed for orbital analysts
-            working in the space domain. This application enables you to view, analyze, and manage
-            orbital scenarios with AI-powered digital twin insights.
+          <Typography variant="body1" color="text.secondary">
+            Conjunction assessment on Space-Track data, built on Databricks
           </Typography>
-          <Typography variant="body1" paragraph>
-            Whether you&apos;re working with testing data, training models, or analyzing operational
-            scenarios, this platform provides the tools you need to make informed decisions about
-            satellite behavior, conjunction risks, and orbital dynamics.
-          </Typography>
-        </Paper>
+        </Box>
+      </Stack>
 
-        <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 2 }}>
-            <SecurityIcon color="primary" />
-            <Typography variant="h5" fontWeight={600}>
-              Key Features
-            </Typography>
-          </Stack>
-          <List>
-            {features.map((feature, index) => (
-              <React.Fragment key={feature}>
-                <ListItem>
-                  <ListItemIcon>
-                    <CheckCircleIcon color="primary" />
-                  </ListItemIcon>
-                  <ListItemText primary={feature} />
-                </ListItem>
-                {index < features.length - 1 && <Divider />}
-              </React.Fragment>
-            ))}
-          </List>
-        </Paper>
+      <Typography variant="body1" sx={{ mt: 3, mb: 3, maxWidth: 900 }}>
+        OrbitWatch ingests the public Space-Track conjunction data messages (CDMs) and GP element
+        sets, groups CDM updates into events, scores each CDM with an XGBoost model, and serves the
+        results to this app from Lakebase. Operators triage by risk tier, inspect the geometry in
+        3D, and ask an assistant that answers from the live data. It is decision support: screening
+        and notifications remain with 18 SDS.
+      </Typography>
 
-        <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-          <Typography variant="h5" gutterBottom fontWeight={600}>
-            Data Quality Types
-          </Typography>
-          <Stack spacing={3} sx={{ mt: 2 }}>
-            <Box>
-              <Typography variant="h6" sx={{ color: 'testing.main', fontWeight: 600 }} gutterBottom>
-                Testing Data
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                Scenarios used for testing and validating prediction algorithms, collision detection
-                systems, and other analytical tools. These scenarios often include historical data
-                with known outcomes.
-              </Typography>
+      <Grid container spacing={2.5}>
+        <Grid item xs={12}>
+          <Section icon={<ModelIcon />} title="Definitions">
+            <Box
+              component="dl"
+              sx={{
+                m: 0,
+                display: 'grid',
+                gridTemplateColumns: { xs: '1fr', sm: '180px 1fr' },
+                columnGap: 3,
+                rowGap: 1.25,
+                '& dt': { fontWeight: 700 },
+                '& dd': { m: 0, color: 'text.secondary', mb: { xs: 1, sm: 0 } },
+              }}
+            >
+              {DEFINITIONS.map(d => (
+                <React.Fragment key={d.term}>
+                  <Typography component="dt" variant="body2">
+                    {d.term}
+                  </Typography>
+                  <Typography component="dd" variant="body2">
+                    {d.text}
+                  </Typography>
+                </React.Fragment>
+              ))}
             </Box>
-            <Divider />
-            <Box>
-              <Typography
-                variant="h6"
-                sx={{ color: 'training.main', fontWeight: 600 }}
-                gutterBottom
-              >
-                Training Data
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                Data sets used to train machine learning models and AI digital twins. These
-                scenarios help improve the accuracy and reliability of automated decision-making
-                systems.
-              </Typography>
-            </Box>
-            <Divider />
-            <Box>
-              <Typography
-                variant="h6"
-                sx={{ color: 'operational.main', fontWeight: 600 }}
-                gutterBottom
-              >
-                Operational Data
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                Real-time or near-real-time scenarios representing actual satellite operations.
-                These scenarios require immediate attention and inform critical operational
-                decisions.
-              </Typography>
-            </Box>
-          </Stack>
-        </Paper>
+          </Section>
+        </Grid>
 
-        <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-          <Typography variant="h5" gutterBottom fontWeight={600}>
-            Technologies
-          </Typography>
-          <List>
-            {technologies.map((tech, index) => (
-              <React.Fragment key={tech}>
-                <ListItem>
-                  <ListItemIcon>
-                    <CheckCircleIcon color="primary" />
-                  </ListItemIcon>
-                  <ListItemText primary={tech} />
-                </ListItem>
-                {index < technologies.length - 1 && <Divider />}
-              </React.Fragment>
-            ))}
-          </List>
-        </Paper>
+        <Grid item xs={12} md={6}>
+          <Section icon={<RealIcon />} title="Data provenance">
+            <Stack spacing={1.5}>
+              <Box>
+                <Chip
+                  size="small"
+                  label="REAL"
+                  color="success"
+                  variant="outlined"
+                  sx={{ fontWeight: 700, mb: 0.75 }}
+                />
+                <Typography variant="body2" color="text.secondary">
+                  Conjunctions, TCAs, miss distances, Pc (18 SDS) and the object catalog come from
+                  Space-Track. Orbits in the 3D view are SGP4 propagations of the published GP
+                  element sets.
+                </Typography>
+              </Box>
+              <Box>
+                <Chip
+                  size="small"
+                  label="MODEL"
+                  color="info"
+                  variant="outlined"
+                  sx={{ fontWeight: 700, mb: 0.75 }}
+                />
+                <Typography variant="body2" color="text.secondary">
+                  Pc (ML) and the risk tier changes in ML Insights come from the XGBoost model
+                  registered in Unity Catalog. Its test metrics are shown with the predictions.
+                </Typography>
+              </Box>
+              <Box>
+                <Chip
+                  size="small"
+                  icon={<SimulatedIcon />}
+                  label="SIMULATED"
+                  variant="outlined"
+                  sx={{ fontWeight: 700, mb: 0.75, color: 'text.secondary' }}
+                />
+                <Typography variant="body2" color="text.secondary">
+                  Anomaly events are simulated on real catalog objects to show the triage workflow;
+                  no live detector runs behind them. The tracking network panel is a reference
+                  sensor list.
+                </Typography>
+              </Box>
+            </Stack>
+          </Section>
+        </Grid>
 
-        <Paper elevation={3} sx={{ p: 4, mt: 4 }}>
-          <Typography variant="h5" gutterBottom fontWeight={600}>
-            Getting Started
-          </Typography>
-          <List>
-            <ListItem>
-              <ListItemText
-                primary="1. Browse Scenarios"
-                secondary="Start from the Scenarios dashboard to view your collection of orbital analysis scenarios"
-              />
-            </ListItem>
-            <ListItem>
-              <ListItemText
-                primary="2. Select a Scenario"
-                secondary="Click on any scenario card to open the detailed analysis view"
-              />
-            </ListItem>
-            <ListItem>
-              <ListItemText
-                primary="3. Analyze Data"
-                secondary="Use the 3D visualization, satellite list, metrics, and AI recommendations to perform your analysis"
-              />
-            </ListItem>
-            <ListItem>
-              <ListItemText
-                primary="4. Review AI Insights"
-                secondary="Check the AI Twin panel for automated recommendations and decision support"
-              />
-            </ListItem>
-          </List>
-        </Paper>
-      </Box>
-    </Container>
-  )
-}
+        <Grid item xs={12} md={6}>
+          <Section icon={<LimitsIcon />} title="Limitations">
+            <Stack component="ul" spacing={1} sx={{ m: 0, pl: 2.5, color: 'text.secondary' }}>
+              <Typography component="li" variant="body2">
+                Public CDMs carry no covariance or state vectors, so Pc cannot be recomputed here.
+              </Typography>
+              <Typography component="li" variant="body2">
+                GP element sets with SGP4 have kilometer-level error. The 3D view is for
+                orientation, not screening.
+              </Typography>
+              <Typography component="li" variant="body2">
+                Pc (ML) is experimental. Check the model skill in ML Insights before relying on it.
+              </Typography>
+              <Typography component="li" variant="body2">
+                Data is as fresh as the last pipeline run; the header shows the age of the newest
+                CDM.
+              </Typography>
+              <Typography component="li" variant="body2">
+                Assistant answers come from tool calls on the same data and should be reviewed
+                before acting.
+              </Typography>
+            </Stack>
+          </Section>
+        </Grid>
+
+        <Grid item xs={12}>
+          <Section icon={<KeyboardIcon />} title="Keyboard shortcuts">
+            <Stack direction="row" spacing={3} flexWrap="wrap" useFlexGap>
+              {SHORTCUTS.map(([key, what]) => (
+                <Stack key={key} direction="row" spacing={1} alignItems="center">
+                  <Box
+                    component="kbd"
+                    sx={{
+                      px: 0.75,
+                      py: 0.25,
+                      borderRadius: 0.75,
+                      border: '1px solid rgba(255,255,255,0.25)',
+                      fontFamily: 'inherit',
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                    }}
+                  >
+                    {key}
+                  </Box>
+                  <Typography variant="body2" color="text.secondary">
+                    {what}
+                  </Typography>
+                </Stack>
+              ))}
+            </Stack>
+            <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 1 }}>
+              Panel shortcuts work on an event page.
+            </Typography>
+          </Section>
+        </Grid>
+      </Grid>
+    </Box>
+  </Container>
+)
 
 export default About

@@ -6,13 +6,10 @@ import {
   TelemetryData,
   ScenarioVariant,
   ManeuverPlan,
-  ThreatObject,
-  EWThreat,
   OrbitalParameters,
-  C2Alert,
   SSNDataSource,
-  ClassificationMarking,
   UserProfile,
+  ConjunctionEvent,
 } from '../types'
 
 const satellites: Satellite[] = [
@@ -172,10 +169,10 @@ const aiRecommendations: AIRecommendation[] = [
   {
     id: 'rec-002',
     timestamp: '2025-11-03T14:00:00Z',
-    type: 'monitoring',
+    type: 'conjunction-monitoring',
     priority: 'medium',
     description:
-      'Continue monitoring ISS maneuver performance. Expected delta-v within nominal range.',
+      'Continue monitoring ISS conjunction proximity. Expected miss distance within acceptable range.',
     confidence: 92,
     affectedSensors: ['Velocity', 'Altitude', 'Apogee', 'Perigee'],
     relatedEventId: 'event-002',
@@ -183,7 +180,7 @@ const aiRecommendations: AIRecommendation[] = [
   {
     id: 'rec-003',
     timestamp: '2025-11-03T19:00:00Z',
-    type: 'analysis',
+    type: 're-entry-watch',
     priority: 'low',
     description:
       'Anomaly on STARLINK-1234 likely due to attitude control adjustment. No action required.',
@@ -193,354 +190,40 @@ const aiRecommendations: AIRecommendation[] = [
   },
 ]
 
-// ============================================================================
-// SPACE FORCE OPERATIONAL DATA
-// ============================================================================
-
 /**
- * Classification Markings
- */
-export const classificationUnclassified: ClassificationMarking = {
-  level: 'UNCLASSIFIED',
-}
-
-export const classificationConfidential: ClassificationMarking = {
-  level: 'CONFIDENTIAL',
-  caveats: ['NOFORN'],
-  derivedFrom: 'Multiple Sources',
-  declassifyOn: '20501103',
-}
-
-export const classificationSecret: ClassificationMarking = {
-  level: 'SECRET',
-  caveats: ['NOFORN', 'RELIDO'],
-  sciControls: ['TK', 'SI'],
-  derivedFrom: 'USSF SATOPS',
-  declassifyOn: 'X1',
-}
-
-export const classificationTopSecret: ClassificationMarking = {
-  level: 'TOP SECRET',
-  caveats: ['NOFORN'],
-  sciControls: ['TK', 'SI', 'GAMMA'],
-  derivedFrom: 'NRO/USSF',
-  declassifyOn: 'X1',
-}
-
-/**
- * Hostile/Threat Objects
- */
-export const threatObjects: ThreatObject[] = [
-  {
-    id: 'threat-001',
-    name: 'COSMOS 2558 (INSPECTOR)',
-    noradId: '52981',
-    category: 'active',
-    orbitalParams: {
-      semiMajorAxis: 42164,
-      eccentricity: 0.0001,
-      inclination: 0.02,
-      raan: 45.2,
-      argOfPerigee: 180.0,
-      trueAnomaly: 135.0,
-    },
-    altitude: 35786, // GEO
-    velocity: 3.07,
-    selected: false,
-    threatType: 'co-orbital-threat',
-    threatLevel: 'high',
-    countryOfOrigin: 'RUS',
-    firstDetected: '2025-10-15T08:30:00Z',
-    behaviorProfile: 'proximity-ops',
-    maneuverHistory: [
-      {
-        timestamp: '2025-10-20T12:00:00Z',
-        deltaV: 45.2,
-        description: 'Rapid orbit change toward SBIRS GEO-1',
-        assessed: 'hostile',
-      },
-      {
-        timestamp: '2025-10-25T18:30:00Z',
-        deltaV: 32.1,
-        description: 'Station-keeping adjustment near target',
-        assessed: 'hostile',
-      },
-    ],
-    capabilities: [
-      {
-        type: 'proximity-ops',
-        detectionConfidence: 95,
-        effectiveRange: 50,
-        lastObserved: '2025-11-03T06:00:00Z',
-      },
-      {
-        type: 'electronic',
-        detectionConfidence: 72,
-        lastObserved: '2025-11-02T14:00:00Z',
-      },
-    ],
-    targetedAssets: ['sbirs-geo-1', 'dscs-iii-b8'],
-  },
-  {
-    id: 'threat-002',
-    name: 'SHIYAN-21 (ASAT TEST)',
-    noradId: '51395',
-    category: 'active',
-    orbitalParams: {
-      semiMajorAxis: 7171,
-      eccentricity: 0.012,
-      inclination: 98.5,
-      raan: 234.1,
-      argOfPerigee: 90.0,
-      trueAnomaly: 270.0,
-    },
-    altitude: 800,
-    velocity: 7.45,
-    selected: false,
-    threatType: 'asat-weapon',
-    threatLevel: 'critical',
-    countryOfOrigin: 'CHN',
-    firstDetected: '2025-09-12T03:15:00Z',
-    behaviorProfile: 'aggressive',
-    maneuverHistory: [
-      {
-        timestamp: '2025-10-28T09:45:00Z',
-        deltaV: 120.5,
-        description: 'Large maneuver consistent with intercept trajectory',
-        assessed: 'hostile',
-      },
-      {
-        timestamp: '2025-11-01T16:20:00Z',
-        deltaV: 85.3,
-        description: 'Plane change maneuver toward ISR constellation',
-        assessed: 'hostile',
-      },
-    ],
-    capabilities: [
-      {
-        type: 'kinetic',
-        detectionConfidence: 88,
-        effectiveRange: 100,
-        lastObserved: '2025-11-01T16:20:00Z',
-      },
-    ],
-    targetedAssets: ['usa-290', 'usa-314'],
-  },
-  {
-    id: 'threat-003',
-    name: 'UNKNOWN OBJ 2025-099B',
-    noradId: '58234',
-    category: 'active',
-    orbitalParams: {
-      semiMajorAxis: 6921,
-      eccentricity: 0.0005,
-      inclination: 53.2,
-      raan: 188.4,
-      argOfPerigee: 45.0,
-      trueAnomaly: 180.0,
-    },
-    altitude: 550,
-    velocity: 7.59,
-    selected: false,
-    threatType: 'unknown',
-    threatLevel: 'moderate',
-    countryOfOrigin: 'Unknown',
-    firstDetected: '2025-11-01T22:10:00Z',
-    behaviorProfile: 'surveillance',
-    maneuverHistory: [
-      {
-        timestamp: '2025-11-02T10:30:00Z',
-        deltaV: 15.8,
-        description: 'Minor trajectory adjustment',
-        assessed: 'unknown',
-      },
-    ],
-    capabilities: [],
-    targetedAssets: [],
-  },
-]
-
-/**
- * Electronic Warfare Threats
- */
-export const ewThreats: EWThreat[] = [
-  {
-    id: 'ew-001',
-    type: 'jamming',
-    affectedFrequencies: ['12.5-12.75 GHz', '14.0-14.5 GHz'],
-    affectedSatellites: ['usa-326', 'wgs-11'],
-    sourceLocation: {
-      latitude: 39.9042,
-      longitude: 116.4074,
-      groundStation: 'Beijing SIGINT Site',
-    },
-    startTime: '2025-11-03T08:15:00Z',
-    severity: 'high',
-    classification: classificationUnclassified,
-  },
-  {
-    id: 'ew-002',
-    type: 'spoofing',
-    affectedFrequencies: ['1.57542 GHz'],
-    affectedSatellites: ['gps-iif-12', 'gps-iii-5'],
-    sourceLocation: {
-      latitude: 55.7558,
-      longitude: 37.6173,
-      groundStation: 'Moscow EW Complex',
-    },
-    startTime: '2025-11-02T14:30:00Z',
-    endTime: '2025-11-02T18:45:00Z',
-    severity: 'critical',
-    classification: classificationUnclassified,
-  },
-  {
-    id: 'ew-003',
-    type: 'interference',
-    affectedFrequencies: ['7.25-7.75 GHz'],
-    affectedSatellites: ['dscs-iii-b8'],
-    startTime: '2025-11-03T11:00:00Z',
-    severity: 'moderate',
-    classification: classificationUnclassified,
-  },
-]
-
-/**
- * Command and Control Alerts
- */
-export const c2Alerts: C2Alert[] = [
-  {
-    id: 'alert-001',
-    timestamp: '2025-11-03T08:15:00Z',
-    alertType: 'ew-attack',
-    priority: 'immediate',
-    title: 'ACTIVE JAMMING DETECTED - WGS CONSTELLATION',
-    description:
-      'High-power jamming detected affecting WGS-11 downlinks. Uplink communications degraded by 40%. Source identified as Beijing SIGINT facility. Recommend immediate frequency hopping and power increase.',
-    affectedAssets: ['WGS-11', 'USA-326'],
-    recommendedActions: [
-      'Activate anti-jam protocols on WGS-11',
-      'Switch to backup frequencies',
-      'Increase transmit power by 6dB',
-      'Coordinate with CYBERCOM for counter-EW operations',
-      'Notify allied partners using WGS capacity',
-    ],
-    disseminationList: ['USSF/S3D', 'CYBERCOM', '614 AOC', 'STRATCOM/J3'],
-    classification: classificationUnclassified,
-    acknowledgedBy: ['maj.anderson', 'lt.col.martinez'],
-  },
-  {
-    id: 'alert-002',
-    timestamp: '2025-11-03T06:00:00Z',
-    alertType: 'threat-detection',
-    priority: 'flash',
-    title: 'HOSTILE SATELLITE PROXIMITY OPS - SBIRS GEO-1',
-    description:
-      'COSMOS 2558 has maneuvered to within 50km of SBIRS GEO-1. Object demonstrates co-orbital threat behavior. Potential for close approach, inspection, or hostile action. Threat level: HIGH. IMMEDIATE ASSESSMENT REQUIRED.',
-    affectedAssets: ['SBIRS GEO-1', 'DSCS-III-B8'],
-    recommendedActions: [
-      'Initiate 24/7 tracking and monitoring of COSMOS 2558',
-      'Prepare evasive maneuver options for SBIRS GEO-1',
-      'Alert SBIRS operators to potential interference',
-      'Coordinate with NRO for enhanced surveillance',
-      'Brief USSPACECOM commander immediately',
-      'Prepare diplomatic protest through State Department',
-    ],
-    disseminationList: ['USSPACECOM', 'NRO', 'USSF/S2', 'JCS', 'NSC', 'POTUS'],
-    classification: classificationUnclassified,
-    acknowledgedBy: ['gen.thompson', 'col.rivera', 'maj.anderson'],
-  },
-  {
-    id: 'alert-003',
-    timestamp: '2025-11-03T12:00:00Z',
-    alertType: 'conjunction',
-    priority: 'priority',
-    title: 'HIGH COLLISION PROBABILITY - USA-314',
-    description:
-      'Conjunction predicted between USA-314 (KH-11) and SHIYAN-21 at TCA 2025-11-04T03:45:00Z. Miss distance: 285 meters. Pc: 1:2,500. NOTE: SHIYAN-21 assessed as potential ASAT platform. Maneuver strongly recommended.',
-    affectedAssets: ['USA-314'],
-    recommendedActions: [
-      'Execute collision avoidance maneuver NLT 18 hours prior to TCA',
-      'Coordinate with NRO for ISR asset protection',
-      'Monitor SHIYAN-21 for further maneuvers',
-      'Assess if conjunction is deliberate harassment',
-      'Prepare intelligence report on Chinese ASAT capabilities',
-    ],
-    disseminationList: ['NRO', 'USSF/S3D', '18 SPCS', 'USSPACECOM/J3'],
-    classification: classificationUnclassified,
-    acknowledgedBy: ['col.rivera'],
-  },
-  {
-    id: 'alert-004',
-    timestamp: '2025-11-03T14:30:00Z',
-    alertType: 'anomaly',
-    priority: 'routine',
-    title: 'Telemetry Anomaly - GPS III-5',
-    description:
-      'Minor telemetry anomaly detected on GPS III-5. Solar array current reading 5% below nominal. No impact to navigation signal. Engineering review scheduled.',
-    affectedAssets: ['GPS III-5'],
-    recommendedActions: [
-      'Continue monitoring telemetry',
-      'Engineering team to review solar array performance',
-      'No immediate action required',
-    ],
-    disseminationList: ['USSF/S3D', '2 SOPS'],
-    classification: classificationUnclassified,
-    acknowledgedBy: ['capt.johnson', 'ssgt.williams'],
-  },
-]
-
-/**
- * SSN Data Sources
+ * Tracking Network Data Sources
  */
 export const ssnDataSources: SSNDataSource[] = [
   {
-    sensorId: 'AN/FPS-132',
-    sensorName: 'Space Fence (Kwajalein)',
+    sensorId: 'LEO-RADAR-AK',
+    sensorName: 'LEO Radar Network (Alaska)',
     sensorType: 'radar',
-    location: 'Kwajalein Atoll, Marshall Islands',
-    lastContact: new Date(Date.now() - 2 * 60 * 1000).toISOString(), // 2 minutes ago
-    dataQuality: 98,
+    location: 'Fairbanks, Alaska',
+    lastContact: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    dataQuality: 94,
     trackingObjects: 3842,
   },
   {
-    sensorId: 'PAVE-PAWS-1',
-    sensorName: 'PAVE PAWS (Beale AFB)',
+    sensorId: 'POLAR-RADAR-NO',
+    sensorName: 'Polar Radar Array (Scandinavia)',
     sensorType: 'radar',
-    location: 'Beale AFB, California',
-    lastContact: new Date(Date.now() - 1 * 60 * 1000).toISOString(), // 1 minute ago
-    dataQuality: 94,
+    location: 'Tromsø, Norway',
+    lastContact: new Date(Date.now() - 1 * 60 * 1000).toISOString(),
+    dataQuality: 92,
     trackingObjects: 1256,
   },
   {
-    sensorId: 'PAVE-PAWS-2',
-    sensorName: 'PAVE PAWS (Cape Cod)',
-    sensorType: 'radar',
-    location: 'Cape Cod AFS, Massachusetts',
-    lastContact: new Date(Date.now() - 3 * 60 * 1000).toISOString(),
-    dataQuality: 92,
-    trackingObjects: 1189,
-  },
-  {
-    sensorId: 'GEODSS-1',
-    sensorName: 'GEODSS (Diego Garcia)',
+    sensorId: 'OPT-HAWAII',
+    sensorName: 'Optical Network (Hawaii)',
     sensorType: 'optical',
-    location: 'Diego Garcia, Indian Ocean',
-    lastContact: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-    dataQuality: 88,
-    trackingObjects: 542,
-  },
-  {
-    sensorId: 'GEODSS-2',
-    sensorName: 'GEODSS (Maui)',
-    sensorType: 'optical',
-    location: 'Maui, Hawaii',
+    location: 'Mauna Kea, Hawaii',
     lastContact: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
     dataQuality: 91,
     trackingObjects: 678,
   },
   {
-    sensorId: 'GEODSS-3',
-    sensorName: 'GEODSS (Socorro)',
+    sensorId: 'OPT-NM',
+    sensorName: 'Optical Network (New Mexico)',
     sensorType: 'optical',
     location: 'Socorro, New Mexico',
     lastContact: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
@@ -548,105 +231,153 @@ export const ssnDataSources: SSNDataSource[] = [
     trackingObjects: 523,
   },
   {
-    sensorId: 'SBSS-1',
-    sensorName: 'Space Based Space Surveillance',
+    sensorId: 'SPACE-LEO-1',
+    sensorName: 'Space-Based Sensor (LEO)',
     sensorType: 'space-based',
-    location: 'LEO Orbit (630 km)',
+    location: 'LEO Orbit, 630 km',
     lastContact: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
     dataQuality: 96,
     trackingObjects: 2145,
   },
   {
-    sensorId: 'CLEAR-1',
-    sensorName: 'C-Band Radar (Clear AFS)',
+    sensorId: 'RADAR-AU',
+    sensorName: 'Southern Hemisphere Radar (Australia)',
     sensorType: 'radar',
-    location: 'Clear AFS, Alaska',
-    lastContact: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
-    dataQuality: 89,
+    location: 'Alice Springs, Australia',
+    lastContact: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    dataQuality: 88,
     trackingObjects: 892,
   },
   {
-    sensorId: 'ALTAIR-1',
-    sensorName: 'ALTAIR Radar',
+    sensorId: 'SBAND-AK',
+    sensorName: 'S-Band Tracking Array (Alaska)',
     sensorType: 'radar',
-    location: 'Kwajalein Atoll, Marshall Islands',
+    location: 'Clear, Alaska',
+    lastContact: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    dataQuality: 89,
+    trackingObjects: 1456,
+  },
+  {
+    sensorId: 'OPT-IO',
+    sensorName: 'Equatorial Optical Array (Indian Ocean)',
+    sensorType: 'optical',
+    location: 'Diego Garcia',
+    lastContact: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    dataQuality: 88,
+    trackingObjects: 542,
+  },
+  {
+    sensorId: 'CBAND-PAC',
+    sensorName: 'C-Band Tracking (Pacific)',
+    sensorType: 'radar',
+    location: 'Kwajalein Atoll',
     lastContact: new Date(Date.now() - 7 * 60 * 1000).toISOString(),
     dataQuality: 93,
-    trackingObjects: 1456,
+    trackingObjects: 1189,
   },
 ]
 
 /**
- * User Profiles for RBAC
+ * User Profiles
  */
 export const mockUsers: UserProfile[] = [
   {
     id: 'user-001',
     username: 'john.anderson',
-    rank: 'Maj',
-    unit: 'USSF/S3D Space Operations',
+    organization: 'OrbitWatch Operations',
     role: 'operator',
-    clearanceLevel: 'UNCLASSIFIED',
-    sciAccess: [],
     lastLogin: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-    needToKnow: ['Space Domain Awareness', 'Satellite Operations', 'Conjunction Assessment'],
   },
   {
     id: 'user-002',
     username: 'sarah.rivera',
-    rank: 'Lt Col',
-    unit: '18th Space Defense Squadron',
-    role: 'commander',
-    clearanceLevel: 'TOP SECRET',
-    sciAccess: ['TK', 'SI', 'GAMMA'],
+    organization: 'Constellation Analytics',
+    role: 'analyst',
     lastLogin: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
-    needToKnow: [
-      'Space Domain Awareness',
-      'Threat Assessment',
-      'ASAT Intelligence',
-      'Counter-Space Operations',
-    ],
   },
   {
     id: 'user-003',
     username: 'michael.chen',
-    rank: 'Capt',
-    unit: 'USSF/S2 Intelligence',
+    organization: 'Space Insurance Group',
     role: 'analyst',
-    clearanceLevel: 'TOP SECRET',
-    sciAccess: ['TK', 'SI', 'HCS'],
     lastLogin: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
-    needToKnow: ['Threat Assessment', 'ASAT Intelligence', 'EW Analysis', 'Foreign Space Programs'],
   },
   {
     id: 'user-004',
     username: 'emily.martinez',
-    rank: 'TSgt',
-    unit: '2nd Space Operations Squadron',
+    organization: 'Launch Dynamics Inc.',
     role: 'engineer',
-    clearanceLevel: 'SECRET',
-    sciAccess: ['TK'],
     lastLogin: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(),
-    needToKnow: ['Satellite Operations', 'GPS Constellation', 'Telemetry Analysis'],
+  },
+]
+
+/**
+ * Conjunction Events
+ */
+export const conjunctionEvents: ConjunctionEvent[] = [
+  {
+    id: 'conj-001',
+    cdmId: 'CDM-2025-110301',
+    satelliteA: { id: 'sat-002', name: 'STARLINK-1234', noradId: '45678', operator: 'SpaceX' },
+    satelliteB: { id: 'sat-003', name: 'COSMOS 2251 DEB', noradId: '33456' },
+    tca: new Date(Date.now() + 14 * 60 * 60 * 1000).toISOString(),
+    missDistanceKm: 0.285,
+    rawPc: 0.0022,
+    mlPc: 0.0024,
+    riskTier: 'red',
+    maneuverRecommended: true,
+    maneuverWindowOpen: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+    maneuverWindowClose: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    status: 'active',
   },
   {
-    id: 'user-005',
-    username: 'robert.thompson',
-    rank: 'Brig Gen',
-    unit: 'USSPACECOM/J3',
-    role: 'commander',
-    clearanceLevel: 'TOP SECRET',
-    sciAccess: ['TK', 'SI', 'GAMMA', 'HCS'],
-    lastLogin: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
-    needToKnow: ['All Space Operations', 'Strategic Planning', 'Force Protection', 'Counter-Space'],
+    id: 'conj-002',
+    cdmId: 'CDM-2025-110302',
+    satelliteA: { id: 'ow-082', name: 'ONEWEB-0082', noradId: '47844', operator: 'OneWeb' },
+    satelliteB: { id: 'f9rb-01', name: 'FALCON 9 R/B', noradId: '47890' },
+    tca: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+    missDistanceKm: 0.812,
+    rawPc: 0.00041,
+    mlPc: 0.00045,
+    riskTier: 'amber',
+    maneuverRecommended: true,
+    maneuverWindowOpen: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+    maneuverWindowClose: new Date(Date.now() + 36 * 60 * 60 * 1000).toISOString(),
+    status: 'active',
+  },
+  {
+    id: 'conj-003',
+    cdmId: 'CDM-2025-110303',
+    satelliteA: { id: 'irid-91', name: 'IRIDIUM-91', noradId: '43478', operator: 'Iridium' },
+    satelliteB: { id: 'sl8-deb', name: 'SL-8 DEB', noradId: '18421' },
+    tca: new Date(Date.now() + 4 * 24 * 60 * 60 * 1000).toISOString(),
+    missDistanceKm: 1.243,
+    rawPc: 0.00011,
+    mlPc: 0.00012,
+    riskTier: 'amber',
+    maneuverRecommended: false,
+    status: 'active',
+  },
+  {
+    id: 'conj-004',
+    cdmId: 'CDM-2025-110304',
+    satelliteA: { id: 'sat-001', name: 'ISS', noradId: '25544', operator: 'NASA/Roscosmos' },
+    satelliteB: { id: 'cz4c-deb', name: 'CZ-4C DEB', noradId: '37820' },
+    tca: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString(),
+    missDistanceKm: 4.5,
+    rawPc: 0.000028,
+    mlPc: 0.000032,
+    riskTier: 'green',
+    maneuverRecommended: false,
+    status: 'active',
   },
 ]
 
 export const mockScenarios: Scenario[] = [
   {
     id: 'scenario-001',
-    name: 'LEO Constellation Analysis',
-    description: 'Analysis of low Earth orbit constellation behavior and conjunction risks',
+    name: 'Starlink Constellation Risk Analysis',
+    description: 'AI-calibrated conjunction risk assessment for the Starlink LEO constellation',
     dataQuality: 'operational',
     createdAt: '2025-11-01T10:00:00Z',
     startTime: '2025-11-03T00:00:00Z',
@@ -662,8 +393,8 @@ export const mockScenarios: Scenario[] = [
   },
   {
     id: 'scenario-002',
-    name: 'ISS Reboost Training Set',
-    description: 'Training data for ISS reboost maneuver prediction models',
+    name: 'LEO Crossing Event Monitor',
+    description: 'Monitoring LEO crossing events and proximity alerts for commercial operators',
     dataQuality: 'training',
     createdAt: '2025-10-28T14:30:00Z',
     startTime: '2025-10-30T00:00:00Z',
@@ -679,8 +410,8 @@ export const mockScenarios: Scenario[] = [
   },
   {
     id: 'scenario-003',
-    name: 'Debris Field Collision Risk',
-    description: 'Testing collision prediction algorithms with debris field data',
+    name: 'Debris Field Analysis',
+    description: 'Collision prediction and risk analysis for tracked debris fields',
     dataQuality: 'testing',
     createdAt: '2025-10-25T09:15:00Z',
     startTime: '2025-10-26T00:00:00Z',
@@ -696,8 +427,8 @@ export const mockScenarios: Scenario[] = [
   },
   {
     id: 'scenario-004',
-    name: 'Starlink Constellation Monitor',
-    description: 'Operational monitoring of Starlink constellation behavior',
+    name: 'GEO Belt Proximity Alert',
+    description: 'Proximity monitoring and conjunction screening in the geostationary belt',
     dataQuality: 'operational',
     createdAt: '2025-11-02T16:00:00Z',
     startTime: '2025-11-02T18:00:00Z',
@@ -705,7 +436,7 @@ export const mockScenarios: Scenario[] = [
     duration: 1440,
     satelliteCount: 2,
     aiDecisionStatus: 'nominal',
-    tags: ['Starlink', 'monitoring', 'operational'],
+    tags: ['GEO', 'monitoring', 'operational'],
     satellites: [satellites[1]],
     events: [events[2]],
     aiRecommendations: [aiRecommendations[2]],
@@ -713,8 +444,8 @@ export const mockScenarios: Scenario[] = [
   },
   {
     id: 'scenario-005',
-    name: 'GEO Belt Analysis',
-    description: 'Analysis of geostationary orbit dynamics and stationkeeping',
+    name: 'ISS Conjunction Assessment',
+    description: 'Real-time conjunction assessment and maneuver planning for the ISS',
     dataQuality: 'training',
     createdAt: '2025-10-20T11:00:00Z',
     startTime: '2025-10-22T00:00:00Z',
@@ -722,15 +453,15 @@ export const mockScenarios: Scenario[] = [
     duration: 4320,
     satelliteCount: 5,
     aiDecisionStatus: 'analyzing',
-    tags: ['GEO', 'stationkeeping', 'training'],
+    tags: ['ISS', 'conjunction', 'training'],
     satellites: satellites,
     events: [],
     aiRecommendations: [],
   },
   {
     id: 'scenario-006',
-    name: 'Re-entry Prediction Test',
-    description: 'Testing re-entry prediction models with historical data',
+    name: 'Re-entry Prediction Scenario',
+    description: 'Re-entry prediction modeling and ground impact footprint analysis',
     dataQuality: 'testing',
     createdAt: '2025-10-18T13:45:00Z',
     startTime: '2025-10-19T00:00:00Z',

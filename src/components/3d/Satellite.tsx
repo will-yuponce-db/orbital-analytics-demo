@@ -3,6 +3,7 @@ import { Mesh } from 'three'
 import { Html } from '@react-three/drei'
 import { Satellite as SatelliteType } from '../../types'
 import { calculateSimpleOrbitPosition } from '../../utils/orbitalCalculations'
+import { satrecFor, scenePosition } from '../../utils/satrec'
 
 interface SatelliteProps {
   satellite: SatelliteType
@@ -11,41 +12,42 @@ interface SatelliteProps {
   onClick?: (satellite: SatelliteType) => void
 }
 
-const Satellite: React.FC<SatelliteProps> = ({
-  satellite,
+const SatelliteComponent: React.FC<SatelliteProps> = ({
+  satellite: sat,
   currentTime,
   showLabel = true,
   onClick,
 }) => {
   const meshRef = useRef<Mesh>(null)
 
-  // Calculate position based on orbital parameters and current time
+  // SGP4 with the real TLE when available, a simple Keplerian orbit otherwise.
   const position = useMemo(() => {
-    return calculateSimpleOrbitPosition(satellite.orbitalParams, currentTime)
-  }, [satellite.orbitalParams, currentTime])
+    const pos = scenePosition(satrecFor(sat.tle), currentTime)
+    if (pos) return { x: pos[0], y: pos[1], z: pos[2] }
+    const v = calculateSimpleOrbitPosition(sat.orbitalParams, currentTime)
+    return { x: v.x, y: v.y, z: v.z }
+  }, [sat.orbitalParams, sat.tle, currentTime])
 
-  // Color based on satellite category
   const color = useMemo(() => {
-    switch (satellite.category) {
+    switch (sat.category) {
       case 'active':
-        return satellite.selected ? '#00ff00' : '#4ade80'
+        return sat.selected ? '#00ff00' : '#4ade80'
       case 'debris':
-        return satellite.selected ? '#ff4444' : '#ef4444'
+        return sat.selected ? '#ff4444' : '#ef4444'
       case 'rocket-body':
-        return satellite.selected ? '#ffaa00' : '#f59e0b'
+        return sat.selected ? '#ffaa00' : '#f59e0b'
       default:
         return '#888888'
     }
-  }, [satellite.category, satellite.selected])
+  }, [sat.category, sat.selected])
 
-  // Size based on selection
-  const size = satellite.selected ? 0.08 : 0.05
+  const size = sat.selected ? 0.08 : 0.05
 
   return (
-    <group position={position}>
+    <group position={[position.x, position.y, position.z]}>
       <mesh
         ref={meshRef}
-        onClick={() => onClick?.(satellite)}
+        onClick={() => onClick?.(sat)}
         onPointerOver={e => {
           e.stopPropagation()
           document.body.style.cursor = 'pointer'
@@ -59,14 +61,13 @@ const Satellite: React.FC<SatelliteProps> = ({
         <meshStandardMaterial
           color={color}
           emissive={color}
-          emissiveIntensity={satellite.selected ? 0.5 : 0.3}
+          emissiveIntensity={sat.selected ? 0.5 : 0.3}
           metalness={0.8}
           roughness={0.2}
         />
       </mesh>
 
-      {/* Label */}
-      {showLabel && satellite.selected && (
+      {showLabel && sat.selected && (
         <Html distanceFactor={10}>
           <div
             style={{
@@ -80,7 +81,7 @@ const Satellite: React.FC<SatelliteProps> = ({
               border: `1px solid ${color}`,
             }}
           >
-            {satellite.name}
+            {sat.name}
           </div>
         </Html>
       )}
@@ -88,4 +89,4 @@ const Satellite: React.FC<SatelliteProps> = ({
   )
 }
 
-export default Satellite
+export default SatelliteComponent
