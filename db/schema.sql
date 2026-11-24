@@ -48,8 +48,18 @@ CREATE TABLE IF NOT EXISTS conjunction_events (
     maneuver_window_close TIMESTAMP,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active','resolved','maneuvered')),
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    -- Event-level fields (one row per physical conjunction; see db/reverse_etl.py)
+    miss_distance_m DOUBLE PRECISION,
+    event_key TEXT,
+    cdm_count INTEGER DEFAULT 1,
+    first_pc DOUBLE PRECISION,
+    max_pc DOUBLE PRECISION,
+    pc_history JSONB,
+    cdm_created_at TIMESTAMP
 );
+-- ml_predictions and ml_model_summary are full copies of the Unity Catalog
+-- tables in orbitwatch_ml, (re)created by db/reverse_etl.py on every load.
 
 -- AI recommendations
 CREATE TABLE IF NOT EXISTS ai_recommendations (

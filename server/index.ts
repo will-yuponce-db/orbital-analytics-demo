@@ -1,321 +1,2009 @@
 import express from 'express'
 import cors from 'cors'
+import { Client, types } from 'pg'
 import path from 'path'
-import { fileURLToPath } from 'url'
-import Database from 'better-sqlite3'
-import { initializeDatabase } from './db/schema.js'
-import { seedDatabase } from './db/seed.js'
+import type Database from 'better-sqlite3'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+// Lakebase stores TCA and CDM times as UTC in `timestamp without time zone`
+// columns. node-postgres would read those in the process's local time zone, so
+// parse them as UTC explicitly (correct on a laptop as well as in the app).
+types.setTypeParser(1114, (v: string) => new Date(v.replace(' ', 'T') + 'Z'))
 
-const app = express()
-const PORT = process.env.PORT || 3000
+// ─── Local dev mode (SQLite) ─────────────────────────────────────────────────
+// better-sqlite3 has native bindings and is only needed for local dev. It is
+// loaded lazily (tsc emits a deferred require for this dynamic import), so
+// production (PGHOST set) never loads the native module and the deployed
+// Databricks App never depends on a platform-specific .node binary.
+const isLocalMode = !process.env.PGHOST
+let localDb: Database.Database | null = null
+const localDbReady: Promise<void> = isLocalMode
+  ? import('./db/local').then(({ createLocalDb }) => {
+      localDb = createLocalDb()
+      console.log('[local] Running in LOCAL mode with SQLite -- no Postgres/Databricks required')
+    })
+  : Promise.resolve()
 
-// Initialize database
-const dbPath = path.join(__dirname, 'satellite.db')
-const db = initializeDatabase(dbPath)
-
-// Seed database if empty
-const scenarioCount = db.prepare('SELECT COUNT(*) as count FROM scenarios').get() as { count: number }
-if (scenarioCount.count === 0) {
-  console.log('🌱 Seeding database...')
-  seedDatabase(db)
+// ─── PG auth helper: prefer forwarded user token, fallback to M2M ────────────
+let _lastForwardedToken: string | null = null
+// PG_AUTH_MODE=sp: always connect as the app service principal (PGUSER falls back to its client id)
+const pgSpMode = process.env.PG_AUTH_MODE === 'sp'
+function getPgPassword(req?: express.Request): string | Promise<string> {
+  if (pgSpMode) return getM2MToken()
+  const forwarded = req?.headers?.['x-forwarded-access-token'] as string | undefined
+  if (forwarded) {
+    _lastForwardedToken = forwarded
+    return forwarded
+  }
+  if (_lastForwardedToken) return _lastForwardedToken
+  if (process.env.PGPASSWORD) return process.env.PGPASSWORD
+  return getM2MToken()
 }
 
-// Middleware
+// ─── TLE parsing helpers ──────────────────────────────────────────────────────
+function parseTleToOrbitalParams(line1: string, line2: string) {
+  const fields = line2.trim().split(/\s+/)
+  const inclination = parseFloat(fields[2])
+  const raan = parseFloat(fields[3])
+  const eccentricity = parseFloat('0.' + fields[4])
+  const argOfPerigee = parseFloat(fields[5])
+  const meanAnomaly = parseFloat(fields[6])
+  const meanMotion = parseFloat(fields[7].substring(0, 11))
+  const mu = 398600.4418
+  const n_rad_s = (meanMotion * 2 * Math.PI) / 86400
+  const semiMajorAxis = Math.pow(mu / (n_rad_s * n_rad_s), 1 / 3)
+  const altitudeKm = semiMajorAxis - 6371
+  const velocityKms = Math.sqrt(mu / semiMajorAxis)
+  const epochYear = parseInt(line1.substring(18, 20))
+  const epochDay = parseFloat(line1.substring(20, 32))
+  const year = epochYear < 57 ? 2000 + epochYear : 1900 + epochYear
+  const epochDate = new Date(year, 0, 1)
+  epochDate.setDate(epochDate.getDate() + Math.floor(epochDay) - 1)
+  epochDate.setSeconds(epochDate.getSeconds() + (epochDay % 1) * 86400)
+  return {
+    inclination,
+    raan,
+    eccentricity,
+    argOfPerigee,
+    trueAnomaly: meanAnomaly,
+    semiMajorAxis,
+    altitudeKm,
+    velocityKms,
+    epoch: epochDate.toISOString(),
+    meanMotion,
+    bstar: parseFloat(line1.substring(53, 61).replace('-', 'e-').replace('+', 'e+')) || 0,
+  }
+}
+
+// Fetch TLE — read from Lakebase first (stored from Space-Track GP data), external fallback
+async function fetchTle(
+  noradId: string
+): Promise<{ name: string; line1: string; line2: string } | null> {
+  // Local mode: read from SQLite first, then try external APIs
+  if (localDb) {
+    const row = localDb
+      .prepare(
+        'SELECT name, tle_line1, tle_line2 FROM satellites WHERE norad_id = ? AND tle_line1 IS NOT NULL'
+      )
+      .get(noradId) as { name: string; tle_line1: string; tle_line2: string } | undefined
+    if (row && row.tle_line1) return { name: row.name, line1: row.tle_line1, line2: row.tle_line2 }
+    // Fall through to external APIs even in local mode
+  }
+
+  // Try Lakebase first (fastest, no network dependency)
+  if (!isLocalMode) {
+    try {
+      const password = await getPgPassword()
+      const client = new Client({
+        host: process.env.PGHOST,
+        port: parseInt(process.env.PGPORT || '5432'),
+        database: process.env.PGDATABASE || 'orbitwatch',
+        user:
+          process.env.PGUSER || process.env.DATABRICKS_CLIENT_ID || 'will.yuponce@databricks.com',
+        password,
+        ssl: { rejectUnauthorized: false },
+        connectionTimeoutMillis: 8000,
+      })
+      await client.connect()
+      try {
+        const result = await client.query(
+          'SELECT name, tle_line1, tle_line2 FROM satellites WHERE norad_id = $1 AND tle_line1 IS NOT NULL',
+          [noradId]
+        )
+        if (result.rows.length > 0 && result.rows[0].tle_line1) {
+          return {
+            name: result.rows[0].name,
+            line1: result.rows[0].tle_line1,
+            line2: result.rows[0].tle_line2,
+          }
+        }
+      } finally {
+        await client.end().catch(() => {})
+      }
+    } catch {
+      /* fall through to external sources */
+    }
+  }
+  // Fallback: Celestrak
+  try {
+    const url = `https://celestrak.org/NORAD/elements/gp.php?CATNR=${noradId}&FORMAT=TLE`
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) })
+    if (resp.ok) {
+      const text = await resp.text()
+      const lines = text
+        .trim()
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+      if (lines.length >= 3) return { name: lines[0], line1: lines[1], line2: lines[2] }
+    }
+  } catch {
+    /* fall through */
+  }
+  // Fallback: tle.ivanstanojevic.me
+  try {
+    const url = `https://tle.ivanstanojevic.me/api/tle/${noradId}`
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) })
+    if (!resp.ok) return null
+    const data = (await resp.json()) as { name: string; line1: string; line2: string }
+    if (data.line1 && data.line2) return { name: data.name, line1: data.line1, line2: data.line2 }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+const app = express()
+const PORT = process.env.PORT || 3001
+
 app.use(cors())
 app.use(express.json())
 
-// Helper function to parse JSON fields
-function parseJsonFields(obj: any, fields: string[]) {
-  const result = { ...obj }
-  fields.forEach(field => {
-    if (result[field]) {
-      try {
-        result[field] = JSON.parse(result[field])
-      } catch (e) {
-        // Leave as is if not valid JSON
-      }
-    }
+// M2M OAuth token cache
+let m2mToken: { value: string; expiresAt: number } | null = null
+
+async function getM2MToken(): Promise<string> {
+  if (isLocalMode) return 'local-dev-token'
+
+  // Return cached token if still valid (refresh 5 min early)
+  if (m2mToken && Date.now() < m2mToken.expiresAt - 5 * 60 * 1000) {
+    return m2mToken.value
+  }
+
+  const host = process.env.DATABRICKS_HOST
+  const clientId = process.env.DATABRICKS_CLIENT_ID
+  const clientSecret = process.env.DATABRICKS_CLIENT_SECRET
+
+  if (!host || !clientId || !clientSecret) {
+    throw new Error('Missing DATABRICKS_HOST, DATABRICKS_CLIENT_ID, or DATABRICKS_CLIENT_SECRET')
+  }
+
+  const baseUrl = host.startsWith('http') ? host : `https://${host}`
+  const resp = await fetch(`${baseUrl}/oidc/v1/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      scope: 'all-apis',
+      client_id: clientId,
+      client_secret: clientSecret,
+    }).toString(),
   })
-  return result
+
+  if (!resp.ok) {
+    const body = await resp.text()
+    throw new Error(`M2M token fetch failed: ${resp.status} ${body}`)
+  }
+
+  const data = (await resp.json()) as { access_token: string; expires_in: number }
+  m2mToken = {
+    value: data.access_token,
+    expiresAt: Date.now() + data.expires_in * 1000,
+  }
+  console.log('[m2m] Fetched new OAuth token, expires in', data.expires_in, 's')
+  return m2mToken.value
 }
 
-// Helper function to convert snake_case to camelCase
-function toCamelCase(obj: any): any {
-  if (Array.isArray(obj)) {
-    return obj.map(toCamelCase)
+async function query(req: express.Request, sql: string, params: unknown[] = []) {
+  if (localDb) {
+    return localQuery(localDb, sql, params)
   }
-  if (obj !== null && typeof obj === 'object') {
-    return Object.keys(obj).reduce((result, key) => {
-      const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase())
-      result[camelKey] = toCamelCase(obj[key])
-      return result
-    }, {} as any)
-  }
-  return obj
-}
-
-// ============================================================================
-// API ENDPOINTS
-// ============================================================================
-
-// Get all scenarios
-app.get('/api/scenarios', (req, res) => {
+  const password = await getPgPassword(req)
+  const client = new Client({
+    host: process.env.PGHOST,
+    port: parseInt(process.env.PGPORT || '5432'),
+    database: process.env.PGDATABASE || 'orbitwatch',
+    user: process.env.PGUSER || process.env.DATABRICKS_CLIENT_ID || 'will.yuponce@databricks.com',
+    password,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 8000,
+    query_timeout: 15000,
+  })
+  await client.connect()
   try {
-    const scenarios = db.prepare('SELECT * FROM scenarios').all()
-    
-    const scenariosWithData = scenarios.map((scenario: any) => {
-      // Get satellites for this scenario
-      const satellites = db.prepare(`
-        SELECT s.* FROM satellites s
-        JOIN scenario_satellites ss ON s.id = ss.satellite_id
-        WHERE ss.scenario_id = ?
-      `).all(scenario.id)
+    return await client.query(sql, params)
+  } finally {
+    await client.end().catch(() => {})
+  }
+}
 
-      // Get events
-      const events = db.prepare('SELECT * FROM events WHERE scenario_id = ?').all(scenario.id)
+function localQuery(
+  db: Database.Database,
+  sql: string,
+  params: unknown[] = []
+): { rows: Record<string, unknown>[]; rowCount: number } {
+  // Convert Postgres $1, $2, ... placeholders to SQLite ? placeholders
+  // Must reorder params if $N references are not sequential or repeated
+  const paramRefs: number[] = []
+  const sqliteSql = sql.replace(/\$(\d+)/g, (_match, num) => {
+    paramRefs.push(parseInt(num))
+    return '?'
+  })
 
-      // Get AI recommendations
-      const aiRecommendations = db.prepare('SELECT * FROM ai_recommendations WHERE scenario_id = ?').all(scenario.id)
+  // Build the reordered params array based on $N references
+  let reorderedParams: unknown[]
+  if (paramRefs.length > 0) {
+    reorderedParams = paramRefs.map(n => params[n - 1])
+  } else {
+    reorderedParams = params
+  }
 
-      // Get telemetry data
-      const telemetryData = db.prepare('SELECT * FROM telemetry_data WHERE scenario_id = ?').all(scenario.id)
+  // Rewrite Postgres-specific SQL for SQLite compatibility
+  let fixedSql = sqliteSql
 
+  // Replace LATERAL JOIN with a correlated subquery
+  // Pattern: LEFT JOIN LATERAL ( SELECT ... FROM table WHERE col = ref ORDER BY ... LIMIT 1 ) alias ON true
+  fixedSql = fixedSql.replace(
+    /LEFT\s+JOIN\s+LATERAL\s*\(\s*SELECT\s+\*\s+FROM\s+(\w+)\s+WHERE\s+(\w+)\s*=\s*(\S+)\s+ORDER\s+BY\s+(\w+)\s+DESC\s+LIMIT\s+1\s*\)\s+(\w+)\s+ON\s+true/gi,
+    (_m, table, col, ref, orderCol, alias) => {
+      return `LEFT JOIN ${table} ${alias} ON ${alias}.${col} = ${ref} AND ${alias}.id = (SELECT id FROM ${table} WHERE ${col} = ${ref} ORDER BY ${orderCol} DESC LIMIT 1)`
+    }
+  )
+
+  // Replace COUNT(*) FILTER (WHERE cond) with SUM(CASE WHEN cond THEN 1 ELSE 0 END)
+  fixedSql = fixedSql.replace(
+    /COUNT\(\*\)\s+FILTER\s*\(\s*WHERE\s+([^)]+)\)/gi,
+    (_m, cond) => `SUM(CASE WHEN ${cond} THEN 1 ELSE 0 END)`
+  )
+
+  // Remove NULLS LAST (SQLite sorts NULLs first by default for ASC, last for DESC -- close enough)
+  fixedSql = fixedSql.replace(/\s+NULLS\s+LAST/gi, '')
+
+  const trimmed = fixedSql.trim().toUpperCase()
+  const isSelect = trimmed.startsWith('SELECT') || trimmed.startsWith('WITH')
+
+  if (isSelect) {
+    const rows = db.prepare(fixedSql).all(...reorderedParams) as Record<string, unknown>[]
+    return { rows, rowCount: rows.length }
+  } else {
+    // Check for RETURNING clause
+    const hasReturning = /RETURNING\s+/i.test(fixedSql)
+    if (hasReturning) {
+      // SQLite doesn't support RETURNING in older versions, simulate it
+      const sqlNoReturning = fixedSql.replace(/\s+RETURNING\s+.*/i, '')
+      const result = db.prepare(sqlNoReturning).run(...reorderedParams)
+      // Re-query the affected row
+      const tableMatch = sql.match(/(?:INSERT\s+INTO|UPDATE)\s+(\w+)/i)
+      if (tableMatch) {
+        const tableName = tableMatch[1]
+        if (trimmed.startsWith('INSERT')) {
+          const rows = db
+            .prepare(`SELECT * FROM ${tableName} WHERE id = ?`)
+            .all(result.lastInsertRowid) as Record<string, unknown>[]
+          return { rows, rowCount: result.changes }
+        } else {
+          // UPDATE ... WHERE id = ? RETURNING * -- get the id from params
+          const idMatch = sql.match(/WHERE\s+id\s*=\s*\$(\d+)/i)
+          if (idMatch) {
+            const idParam = params[parseInt(idMatch[1]) - 1]
+            const rows = db
+              .prepare(`SELECT * FROM ${tableName} WHERE id = ?`)
+              .all(idParam) as Record<string, unknown>[]
+            return { rows, rowCount: result.changes }
+          }
+        }
+      }
+      return { rows: [], rowCount: result.changes }
+    } else {
+      const result = db.prepare(fixedSql).run(...reorderedParams)
+      return { rows: [], rowCount: result.changes }
+    }
+  }
+}
+
+// ─── Conjunction event helpers ────────────────────────────────────────────────
+type Row = Record<string, unknown>
+
+function num(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+// TCA is stored as UTC. Time filters bind an ISO timestamp parameter, so the
+// same SQL works on Lakebase (Postgres) and in local SQLite mode.
+function nowIso(offsetHours = 0): string {
+  return new Date(Date.now() + offsetHours * 3_600_000).toISOString()
+}
+
+interface PcPoint {
+  createdAt: string
+  pc: number | null
+  missDistanceM: number | null
+}
+
+function parsePcHistory(v: unknown): PcPoint[] {
+  let arr: unknown = v
+  if (typeof v === 'string') {
+    try {
+      arr = JSON.parse(v)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(arr)) return []
+  return arr
+    .map(h => {
+      const o = (h ?? {}) as Row
       return {
-        ...scenario,
-        tags: JSON.parse(scenario.tags),
-        satellites: satellites.map((sat: any) => ({
-          ...sat,
-          selected: sat.selected === 1,
-          orbitalParams: {
-            semiMajorAxis: sat.semi_major_axis,
-            eccentricity: sat.eccentricity,
-            inclination: sat.inclination,
-            raan: sat.raan,
-            argOfPerigee: sat.arg_of_perigee,
-            trueAnomaly: sat.true_anomaly,
+        createdAt: String(o.created_at ?? o.createdAt ?? ''),
+        pc: num(o.pc),
+        missDistanceM: num(o.miss_distance_m ?? o.missDistanceM),
+      }
+    })
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+}
+
+// conjunction_events holds one row per physical event (its latest CDM), plus
+// the number of CDM updates and the Pc history across them.
+const CONJ_COLUMNS = `
+  ce.id, ce.cdm_id, ce.tca, ce.miss_distance_km, ce.miss_distance_m,
+  ce.raw_pc, ce.ml_pc, ce.risk_tier,
+  ce.maneuver_recommended, ce.maneuver_window_open, ce.maneuver_window_close,
+  ce.status, ce.created_at, ce.event_key, ce.cdm_count, ce.first_pc, ce.max_pc, ce.pc_history,
+  sa.id as sat_a_id, sa.name as sat_a_name, sa.norad_id as sat_a_norad, sa.operator as sat_a_operator,
+  sb.id as sat_b_id, sb.name as sat_b_name, sb.norad_id as sat_b_norad, sb.operator as sat_b_operator`
+const CONJ_FROM = `
+  FROM conjunction_events ce
+  JOIN satellites sa ON ce.satellite_a_id = sa.id
+  JOIN satellites sb ON ce.satellite_b_id = sb.id`
+
+// "passed" is derived at read time: once TCA is behind us the event is no
+// longer actionable, whatever status was stored when it was loaded.
+function toEvent(row: Row, nowMs = Date.now()) {
+  const tcaMs = new Date(row.tca as string).getTime()
+  const passed = Number.isFinite(tcaMs) && tcaMs < nowMs
+  const missM = num(row.miss_distance_m)
+  return {
+    id: String(row.id),
+    cdmId: row.cdm_id,
+    tca: row.tca,
+    missDistanceKm: missM !== null ? missM / 1000 : num(row.miss_distance_km),
+    missDistanceM: missM,
+    rawPc: num(row.raw_pc) ?? undefined,
+    mlPc: num(row.ml_pc),
+    riskTier: row.risk_tier,
+    maneuverRecommended: passed ? false : Boolean(row.maneuver_recommended),
+    maneuverWindowOpen: row.maneuver_window_open,
+    maneuverWindowClose: row.maneuver_window_close,
+    status: passed ? 'passed' : row.status,
+    hoursToTca: Number.isFinite(tcaMs) ? (tcaMs - nowMs) / 3_600_000 : null,
+    eventKey: row.event_key ?? null,
+    cdmCount: num(row.cdm_count) ?? 1,
+    firstPc: num(row.first_pc),
+    maxPc: num(row.max_pc),
+    pcHistory: parsePcHistory(row.pc_history),
+    satelliteA: {
+      id: String(row.sat_a_id),
+      name: row.sat_a_name,
+      noradId: row.sat_a_norad,
+      operator: row.sat_a_operator,
+    },
+    satelliteB: {
+      id: String(row.sat_b_id),
+      name: row.sat_b_name,
+      noradId: row.sat_b_norad,
+      operator: row.sat_b_operator,
+    },
+  }
+}
+
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    await query(req, 'SELECT 1')
+    res.json({ status: 'ok', db: 'connected' })
+  } catch (err: unknown) {
+    res
+      .status(500)
+      .json({ status: 'error', db: 'disconnected', message: errMessage(err).substring(0, 200) })
+  }
+})
+
+app.get('/api/debug-env', (_req, res) => {
+  const dbVars: Record<string, string> = {}
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith('DATABRICKS_') || k.startsWith('PG') || k === 'PORT' || k === 'NODE_ENV') {
+      dbVars[k] = k.includes('SECRET') || k.includes('PASS') ? `[set, len=${v?.length}]` : v || ''
+    }
+  }
+  res.json(dbVars)
+})
+
+// GET /api/conjunctions - one row per conjunction event
+//   ?status=active (default): upcoming events (TCA in the future), riskiest first
+//   ?status=passed&since_hours=24: events whose TCA passed in that window, latest first
+//   ?status=all: everything (stored statuses such as resolved or maneuvered also work)
+//   ?norad_ids=25544,45678 limits to events involving those objects
+app.get('/api/conjunctions', async (req, res) => {
+  try {
+    const { status = 'active', limit = 50, norad_ids, since_hours = 24 } = req.query
+    const noradList =
+      typeof norad_ids === 'string'
+        ? norad_ids
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean)
+        : []
+    const params: unknown[] = [Math.min(Math.max(Number(limit) || 50, 1), 500)]
+    const conditions: string[] = []
+    if (status === 'active') {
+      params.push(nowIso())
+      conditions.push(`ce.tca >= $${params.length}`)
+    } else if (status === 'passed') {
+      params.push(nowIso(), nowIso(-(Number(since_hours) || 24)))
+      conditions.push(`ce.tca < $${params.length - 1} AND ce.tca >= $${params.length}`)
+    } else if (status !== 'all') {
+      params.push(String(status))
+      conditions.push(`ce.status = $${params.length}`)
+    }
+    if (noradList.length > 0) {
+      const placeholders = noradList.map((_, i) => `$${params.length + 1 + i}`).join(',')
+      params.push(...noradList)
+      conditions.push(`(sa.norad_id IN (${placeholders}) OR sb.norad_id IN (${placeholders}))`)
+    }
+    const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : ''
+    const order = status === 'passed' ? 'ce.tca DESC' : 'ce.ml_pc DESC NULLS LAST, ce.tca ASC'
+    const result = await query(
+      req,
+      `
+      SELECT ${CONJ_COLUMNS}
+      ${CONJ_FROM}
+      ${whereClause}
+      ORDER BY ${order}
+      LIMIT $1
+    `,
+      params
+    )
+
+    const nowMs = Date.now()
+    const events = result.rows.map(row => toEvent(row, nowMs))
+
+    res.json(events)
+  } catch (err) {
+    console.error('Error fetching conjunctions:', err)
+    res.status(500).json({ error: 'Failed to fetch conjunctions' })
+  }
+})
+
+// GET /api/conjunctions/:id - single conjunction with recommendations
+app.get('/api/conjunctions/:id', async (req, res) => {
+  try {
+    const { id } = req.params
+    // Try cdm_id first (Space-Track CDM IDs are large numbers like 1372680015),
+    // fall back to serial id only for small numbers
+    const isSmallNumeric = /^\d+$/.test(id) && parseInt(id) < 100000
+    const whereClause = isSmallNumeric ? 'ce.id = $1' : 'ce.cdm_id = $1'
+    const eventResult = await query(
+      req,
+      `
+      SELECT ${CONJ_COLUMNS}
+      ${CONJ_FROM}
+      WHERE ${whereClause}
+    `,
+      [id]
+    )
+
+    if (eventResult.rows.length === 0) return res.status(404).json({ error: 'Not found' })
+    const row = eventResult.rows[0]
+    const recResult = await query(
+      req,
+      `SELECT * FROM ai_recommendations WHERE conjunction_id = $1 ORDER BY priority ASC`,
+      [row.id]
+    )
+
+    // Fetch TLEs for both satellites in parallel
+    const [tleA, tleB] = await Promise.all([fetchTle(row.sat_a_norad), fetchTle(row.sat_b_norad)])
+    const orbitalA = tleA ? parseTleToOrbitalParams(tleA.line1, tleA.line2) : null
+    const orbitalB = tleB ? parseTleToOrbitalParams(tleB.line1, tleB.line2) : null
+
+    const event = toEvent(row)
+    res.json({
+      ...event,
+      satelliteA: { ...event.satelliteA, tle: tleA, orbitalParams: orbitalA },
+      satelliteB: { ...event.satelliteB, tle: tleB, orbitalParams: orbitalB },
+      aiRecommendations: recResult.rows.map(r => ({
+        id: String(r.id),
+        type: r.type,
+        priority: r.priority,
+        description: r.description,
+        confidence: r.confidence,
+        timestamp: row.tca,
+      })),
+    })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch conjunction' })
+  }
+})
+
+// GET /api/satellites
+app.get('/api/satellites', async (req, res) => {
+  try {
+    const result = await query(
+      req,
+      `
+      SELECT s.*, oe.altitude_km, oe.velocity_kms, oe.inclination, oe.eccentricity,
+             oe.raan, oe.arg_of_perigee, oe.mean_anomaly, oe.semi_major_axis
+      FROM satellites s
+      LEFT JOIN LATERAL (
+        SELECT * FROM orbital_elements WHERE satellite_id = s.id ORDER BY epoch DESC LIMIT 1
+      ) oe ON true
+      ORDER BY s.name
+    `
+    )
+    res.json(
+      result.rows.map(r => ({
+        id: String(r.id),
+        noradId: r.norad_id,
+        name: r.name,
+        operator: r.operator,
+        constellation: r.constellation,
+        category: r.category,
+        altitude: r.altitude_km,
+        velocity: r.velocity_kms,
+        selected: false,
+        orbitalParams: {
+          semiMajorAxis: r.semi_major_axis,
+          eccentricity: r.eccentricity,
+          inclination: r.inclination,
+          raan: r.raan,
+          argOfPerigee: r.arg_of_perigee,
+          trueAnomaly: r.mean_anomaly,
+        },
+        tle: r.tle_line1 && r.tle_line2 ? { line1: r.tle_line1, line2: r.tle_line2 } : null,
+      }))
+    )
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch satellites' })
+  }
+})
+
+// GET /api/metrics/:noradId — orbital elements for a satellite as TelemetryData
+app.get('/api/metrics/:noradId', async (req, res) => {
+  try {
+    const result = await query(
+      req,
+      `
+      SELECT s.name, s.norad_id, oe.altitude_km, oe.velocity_kms,
+             oe.inclination, oe.eccentricity, oe.raan, oe.mean_motion, oe.bstar, oe.epoch
+      FROM orbital_elements oe
+      JOIN satellites s ON oe.satellite_id = s.id
+      WHERE s.norad_id = $1
+      ORDER BY oe.epoch DESC LIMIT 1
+    `,
+      [req.params.noradId]
+    )
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' })
+    const r = result.rows[0]
+    res.json([
+      {
+        parameter: 'Altitude',
+        value: r.altitude_km != null ? Number(r.altitude_km).toFixed(1) : '--',
+        unit: 'km',
+        status: 'normal',
+      },
+      {
+        parameter: 'Velocity',
+        value: r.velocity_kms != null ? Number(r.velocity_kms).toFixed(3) : '--',
+        unit: 'km/s',
+        status: 'normal',
+      },
+      {
+        parameter: 'Inclination',
+        value: r.inclination != null ? Number(r.inclination).toFixed(2) : '--',
+        unit: '°',
+        status: 'normal',
+      },
+      {
+        parameter: 'Eccentricity',
+        value: r.eccentricity != null ? Number(r.eccentricity).toFixed(6) : '--',
+        unit: '',
+        status: Number(r.eccentricity) > 0.01 ? 'warning' : 'normal',
+      },
+      {
+        parameter: 'RAAN',
+        value: r.raan != null ? Number(r.raan).toFixed(2) : '--',
+        unit: '°',
+        status: 'normal',
+      },
+      {
+        parameter: 'Mean Motion',
+        value: r.mean_motion != null ? Number(r.mean_motion).toFixed(4) : '--',
+        unit: 'rev/day',
+        status: 'normal',
+      },
+      {
+        parameter: 'BSTAR Drag',
+        value: r.bstar != null ? Number(r.bstar).toExponential(2) : '--',
+        unit: '',
+        status: r.bstar != null && Math.abs(Number(r.bstar)) > 0.001 ? 'warning' : 'normal',
+      },
+    ])
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch metrics' })
+  }
+})
+
+// GET /api/recommendations — AI recommendations, optionally filtered by ?norad_ids=
+app.get('/api/recommendations', async (req, res) => {
+  try {
+    const { norad_ids } = req.query
+    const noradList =
+      typeof norad_ids === 'string'
+        ? norad_ids
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean)
+        : []
+    let noradFilter = ''
+    const params: unknown[] = []
+    if (noradList.length > 0) {
+      const placeholders = noradList.map((_, i) => `$${i + 1}`).join(',')
+      params.push(...noradList)
+      noradFilter = `WHERE (sa.norad_id IN (${placeholders}) OR sb.norad_id IN (${placeholders}))`
+    }
+    const result = await query(
+      req,
+      `
+      SELECT ar.id, ar.type, ar.priority, ar.description, ar.confidence, ar.created_at,
+             ce.cdm_id, ce.tca, ce.miss_distance_km, ce.risk_tier,
+             sa.name as sat_a_name, sb.name as sat_b_name
+      FROM ai_recommendations ar
+      JOIN conjunction_events ce ON ar.conjunction_id = ce.id
+      JOIN satellites sa ON ce.satellite_a_id = sa.id
+      JOIN satellites sb ON ce.satellite_b_id = sb.id
+      ${noradFilter}
+      ORDER BY
+        CASE ar.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+        ce.tca ASC
+      LIMIT 20
+    `,
+      params
+    )
+    res.json(
+      result.rows.map(r => ({
+        id: String(r.id),
+        timestamp: r.tca,
+        type: r.type,
+        priority: r.priority,
+        description: r.description,
+        confidence: r.confidence,
+        relatedEventId: r.cdm_id,
+        affectedObjects: [r.sat_a_name, r.sat_b_name],
+      }))
+    )
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch recommendations' })
+  }
+})
+
+// GET /api/tracking-network
+app.get('/api/tracking-network', async (req, res) => {
+  try {
+    const result = await query(req, 'SELECT * FROM tracking_network ORDER BY data_quality DESC')
+    res.json(
+      result.rows.map(r => ({
+        sensorId: r.sensor_id,
+        sensorName: r.sensor_name,
+        sensorType: r.sensor_type,
+        location: r.location,
+        lastContact: r.last_contact,
+        dataQuality: r.data_quality,
+        trackingObjects: r.tracking_objects,
+        status: r.status,
+      }))
+    )
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch tracking network' })
+  }
+})
+
+// GET /api/analytics/risk-summary
+app.get('/api/analytics/risk-summary', async (req, res) => {
+  try {
+    // Upcoming events only: a conjunction whose TCA has passed is not a risk.
+    const result = await query(
+      req,
+      `
+      SELECT
+        risk_tier,
+        COUNT(*) as count,
+        AVG(ml_pc) as avg_pc,
+        MIN(miss_distance_km) as min_miss_distance,
+        MIN(miss_distance_m) as min_miss_distance_m
+      FROM conjunction_events
+      WHERE status = 'active' AND tca >= $1
+      GROUP BY risk_tier
+    `,
+      [nowIso()]
+    )
+    res.json(result.rows)
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to fetch risk summary' })
+  }
+})
+
+// GET /api/pipeline-status
+app.get('/api/pipeline-status', async (req, res) => {
+  try {
+    const result = await query(
+      req,
+      'SELECT MAX(updated_at) as last_updated FROM conjunction_events'
+    )
+    res.json({ lastUpdated: result.rows[0]?.last_updated || null, status: 'live' })
+  } catch {
+    res.json({ lastUpdated: null, status: 'unknown' })
+  }
+})
+
+const DEFAULT_CHAT_MODEL = 'databricks-claude-sonnet-5-5'
+const chatModel = () => process.env.CHAT_MODEL || DEFAULT_CHAT_MODEL
+
+// Run one overview query; a missing optional table (for example the ML copy
+// before its first load) degrades that tile instead of failing the page.
+async function optionalRows(
+  req: express.Request,
+  sql: string,
+  params: unknown[] = []
+): Promise<Row[]> {
+  try {
+    return (await query(req, sql, params)).rows as Row[]
+  } catch (err) {
+    console.warn('[overview] query skipped:', errMessage(err).substring(0, 160))
+    return []
+  }
+}
+
+function eventBrief(row: Row | undefined) {
+  if (!row) return null
+  const e = toEvent(row)
+  return {
+    id: e.id,
+    tca: e.tca,
+    satA: e.satelliteA.name,
+    satB: e.satelliteB.name,
+    riskTier: e.riskTier,
+    rawPc: e.rawPc ?? null,
+    mlPc: e.mlPc,
+    missDistanceM: e.missDistanceM ?? (e.missDistanceKm !== null ? e.missDistanceKm * 1000 : null),
+  }
+}
+
+// GET /api/overview - live mission summary for the home page and header chips
+app.get('/api/overview', async (req, res) => {
+  try {
+    const now = nowIso()
+    const dayAgo = nowIso(-24)
+    const upcoming = `${CONJ_FROM} WHERE ce.tca >= $1 AND ce.status = 'active'`
+    const [counts, next, closest, highest, sats, anomalies, fresh, model] = await Promise.all([
+      optionalRows(
+        req,
+        `
+        SELECT
+          SUM(CASE WHEN tca >= $1 THEN 1 ELSE 0 END) AS upcoming,
+          SUM(CASE WHEN tca >= $1 AND risk_tier = 'red' THEN 1 ELSE 0 END) AS red,
+          SUM(CASE WHEN tca >= $1 AND risk_tier = 'amber' THEN 1 ELSE 0 END) AS amber,
+          SUM(CASE WHEN tca >= $1 AND risk_tier = 'green' THEN 1 ELSE 0 END) AS green,
+          SUM(CASE WHEN tca < $1 AND tca >= $2 THEN 1 ELSE 0 END) AS passed24h,
+          SUM(CASE WHEN tca >= $1 AND maneuver_recommended THEN 1 ELSE 0 END) AS maneuver
+        FROM conjunction_events WHERE status = 'active'`,
+        [now, dayAgo]
+      ),
+      optionalRows(req, `SELECT ${CONJ_COLUMNS} ${upcoming} ORDER BY ce.tca ASC LIMIT 1`, [now]),
+      optionalRows(
+        req,
+        `SELECT ${CONJ_COLUMNS} ${upcoming}
+        ORDER BY COALESCE(ce.miss_distance_m, ce.miss_distance_km * 1000) ASC LIMIT 1`,
+        [now]
+      ),
+      optionalRows(
+        req,
+        `SELECT ${CONJ_COLUMNS} ${upcoming} ORDER BY ce.raw_pc DESC NULLS LAST LIMIT 1`,
+        [now]
+      ),
+      optionalRows(req, 'SELECT COUNT(*) AS n FROM satellites'),
+      optionalRows(
+        req,
+        `
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS critical_high
+        FROM anomaly_events WHERE status <> 'resolved'`
+      ),
+      optionalRows(
+        req,
+        'SELECT MAX(cdm_created_at) AS data_as_of, MAX(created_at) AS loaded_at FROM conjunction_events'
+      ),
+      optionalRows(req, 'SELECT * FROM ml_model_summary ORDER BY trained_at DESC LIMIT 1'),
+    ])
+    const c = counts[0] ?? {}
+    const m = model[0]
+    res.json({
+      dataAsOf: fresh[0]?.data_as_of ?? null,
+      lastLoadedAt: fresh[0]?.loaded_at ?? null,
+      objectsTracked: num(sats[0]?.n) ?? 0,
+      events: {
+        upcoming: num(c.upcoming) ?? 0,
+        red: num(c.red) ?? 0,
+        amber: num(c.amber) ?? 0,
+        green: num(c.green) ?? 0,
+        passed24h: num(c.passed24h) ?? 0,
+        maneuverRecommended: num(c.maneuver) ?? 0,
+      },
+      nextTca: eventBrief(next[0]),
+      closestApproach: eventBrief(closest[0]),
+      highestPc: eventBrief(highest[0]),
+      anomalies: {
+        total: num(anomalies[0]?.total) ?? 0,
+        criticalHigh: num(anomalies[0]?.critical_high) ?? 0,
+      },
+      model: m
+        ? {
+            name: m.model_name ?? null,
+            version: m.model_version != null ? String(m.model_version) : null,
+            trainedAt: m.trained_at ?? null,
+            r2: num(m.r2_log_scale),
+            mae: num(m.mae),
+            nTraining: num(m.n_training_samples),
+            nScored: num(m.total_scored),
+          }
+        : null,
+      chatModel: chatModel(),
+    })
+  } catch (err) {
+    console.error('GET /api/overview error:', err)
+    res.status(500).json({ error: 'Failed to build overview' })
+  }
+})
+
+// POST /api/maneuver-plans
+app.post('/api/maneuver-plans', async (req, res) => {
+  try {
+    const {
+      conjunctionId,
+      satelliteId,
+      deltaVMs,
+      executionTime,
+      fuelCostKg,
+      postManeuverPc,
+      maneuverType,
+    } = req.body
+    const result = await query(
+      req,
+      `
+      INSERT INTO maneuver_plans (conjunction_id, satellite_id, delta_v_ms, execution_time, fuel_cost_kg, post_maneuver_pc, maneuver_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *
+    `,
+      [
+        conjunctionId,
+        satelliteId,
+        deltaVMs,
+        executionTime,
+        fuelCostKg,
+        postManeuverPc,
+        maneuverType || 'in-track',
+      ]
+    )
+    res.status(201).json(result.rows[0])
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to save maneuver plan' })
+  }
+})
+
+// ─── Space-Track API helpers ──────────────────────────────────────────────────
+let spaceTrackCookie: string | null = null
+
+async function spaceTrackLogin(): Promise<string> {
+  const user = process.env.SPACETRACK_USER
+  const pass = process.env.SPACETRACK_PASS
+  if (!user || !pass) throw new Error('SPACETRACK_USER and SPACETRACK_PASS env vars required')
+  const resp = await fetch('https://www.space-track.org/ajaxauth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `identity=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`,
+    redirect: 'manual',
+  })
+  const cookies = resp.headers.getSetCookie?.() || []
+  const cookie = cookies.map(c => c.split(';')[0]).join('; ')
+  if (!cookie) throw new Error('Space-Track login failed')
+  spaceTrackCookie = cookie
+  return cookie
+}
+
+async function spaceTrackQuery(path: string): Promise<unknown[]> {
+  if (!spaceTrackCookie) await spaceTrackLogin()
+  let resp = await fetch(`https://www.space-track.org${path}`, {
+    headers: { Cookie: spaceTrackCookie! },
+    signal: AbortSignal.timeout(30000),
+  })
+  // Re-auth if session expired
+  if (resp.status === 401) {
+    await spaceTrackLogin()
+    resp = await fetch(`https://www.space-track.org${path}`, {
+      headers: { Cookie: spaceTrackCookie! },
+      signal: AbortSignal.timeout(30000),
+    })
+  }
+  if (!resp.ok) throw new Error(`Space-Track query failed: ${resp.status}`)
+  return (await resp.json()) as unknown[]
+}
+
+// POST /api/reseed — fetch real CDMs from Space-Track + TLEs, repopulate Lakebase
+app.post('/api/reseed', async (req, res) => {
+  if (isLocalMode) {
+    return res.json({ ok: true, mode: 'local', message: 'Using pre-seeded local data' })
+  }
+  // Destructive: wipes the app tables and reloads raw CDMs straight from
+  // Space-Track, bypassing the Lakeflow pipeline, event de-duplication, and the
+  // ML scores. Data normally flows pipeline -> ML job -> db/reverse_etl.py.
+  if (process.env.ALLOW_RESEED !== '1') {
+    return res.status(403).json({
+      error:
+        'Reseed is disabled. Refresh data with the Lakeflow pipeline and db/reverse_etl.py, or set ALLOW_RESEED=1.',
+    })
+  }
+  try {
+    console.log('[reseed] Starting real data ingestion from Space-Track...')
+
+    // 1. Fetch upcoming CDMs from Space-Track (real Pc values from 18th SDS)
+    const today = new Date().toISOString().slice(0, 10)
+    const cdmPath = `/basicspacedata/query/class/cdm_public/TCA/%3E${today}/orderby/PC%20desc/limit/50/format/json`
+    console.log('[reseed] Fetching CDMs from Space-Track...')
+    const rawCdms = (await spaceTrackQuery(cdmPath)) as Array<Record<string, string>>
+    console.log(`[reseed] Got ${rawCdms.length} raw CDMs`)
+
+    // Deduplicate CDMs: same pair can appear twice with swapped SAT_1/SAT_2
+    const seen = new Set<string>()
+    const cdms: typeof rawCdms = []
+    for (const cdm of rawCdms) {
+      const pairKey = [cdm.SAT_1_ID, cdm.SAT_2_ID].sort().join('-')
+      const tcaKey = `${pairKey}-${cdm.TCA?.slice(0, 16)}`
+      if (seen.has(tcaKey)) continue
+      seen.add(tcaKey)
+      cdms.push(cdm)
+    }
+    console.log(`[reseed] ${cdms.length} unique CDMs after dedup`)
+
+    // 2. Collect unique NORAD IDs and fetch GP data (with TLE lines)
+    const noradIds = new Set<string>()
+    for (const cdm of cdms) {
+      noradIds.add(cdm.SAT_1_ID)
+      noradIds.add(cdm.SAT_2_ID)
+    }
+
+    // Also add some well-known satellites for the catalog
+    const extraSats = ['25544', '48274', '56780', '44713'] // ISS, Starlink, OneWeb, Starlink
+    for (const id of extraSats) noradIds.add(id)
+
+    console.log(`[reseed] Fetching GP data for ${noradIds.size} satellites from Space-Track...`)
+    const noradList = [...noradIds].join(',')
+    const gpPath = `/basicspacedata/query/class/gp/NORAD_CAT_ID/${noradList}/orderby/NORAD_CAT_ID/format/json`
+    const gpData = (await spaceTrackQuery(gpPath)) as Array<Record<string, string>>
+    console.log(`[reseed] Got ${gpData.length} GP records`)
+
+    // Also fetch some extra Starlinks and debris for the catalog
+    const extraGroups = [
+      `/basicspacedata/query/class/gp/OBJECT_NAME/STARLINK~~/orderby/NORAD_CAT_ID/limit/15/format/json`,
+      `/basicspacedata/query/class/gp/OBJECT_NAME/COSMOS 2251 DEB~~/orderby/NORAD_CAT_ID/limit/10/format/json`,
+      `/basicspacedata/query/class/gp/OBJECT_NAME/FENGYUN 1C DEB~~/orderby/NORAD_CAT_ID/limit/8/format/json`,
+      `/basicspacedata/query/class/gp/OBJECT_NAME/ONEWEB~~/orderby/NORAD_CAT_ID/limit/5/format/json`,
+    ]
+    const extraResults = await Promise.all(extraGroups.map(p => spaceTrackQuery(p).catch(() => [])))
+    for (const group of extraResults) {
+      for (const gp of group as Array<Record<string, string>>) {
+        if (!gpData.find(g => g.NORAD_CAT_ID === gp.NORAD_CAT_ID)) {
+          gpData.push(gp)
+        }
+      }
+    }
+    console.log(`[reseed] Total GP records: ${gpData.length}`)
+
+    // 3. Write to Lakebase
+    console.log('[reseed] Writing to Lakebase...')
+    const client = new Client({
+      host: process.env.PGHOST,
+      port: parseInt(process.env.PGPORT || '5432'),
+      database: process.env.PGDATABASE || 'orbitwatch',
+      user: process.env.PGUSER || process.env.DATABRICKS_CLIENT_ID || 'will.yuponce@databricks.com',
+      password: await getPgPassword(req),
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000,
+    })
+    await client.connect()
+    try {
+      await client.query('BEGIN')
+      // Clear all dependent tables first (anomaly_events has FK to satellites)
+      await client.query('DELETE FROM ai_recommendations')
+      await client.query('DELETE FROM maneuver_plans')
+      await client.query('DELETE FROM conjunction_events')
+      await client.query('DELETE FROM orbital_elements')
+      await client.query('DELETE FROM tracking_network')
+      try {
+        await client.query('DELETE FROM anomaly_events')
+      } catch {
+        /* table may not exist */
+      }
+      await client.query('DELETE FROM satellites')
+
+      // Insert satellites from GP data
+      const satIdMap = new Map<string, number>()
+      for (const gp of gpData) {
+        const noradId = gp.NORAD_CAT_ID
+        const name = gp.OBJECT_NAME || noradId
+        const objType = gp.OBJECT_TYPE || ''
+        const category =
+          objType === 'DEBRIS' ? 'debris' : objType === 'ROCKET BODY' ? 'rocket-body' : 'active'
+        const operator = name.startsWith('STARLINK')
+          ? 'SpaceX'
+          : name.startsWith('ONEWEB')
+            ? 'OneWeb'
+            : name.startsWith('IRIDIUM')
+              ? 'Iridium'
+              : name.includes('ISS')
+                ? 'NASA/Roscosmos'
+                : gp.COUNTRY_CODE || null
+        const constellation = name.startsWith('STARLINK')
+          ? 'Starlink'
+          : name.startsWith('ONEWEB')
+            ? 'OneWeb'
+            : name.startsWith('IRIDIUM')
+              ? 'Iridium NEXT'
+              : null
+
+        const satRes = await client.query(
+          `INSERT INTO satellites (norad_id, name, category, operator, constellation, rcs_size, tle_line1, tle_line2)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (norad_id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, operator=EXCLUDED.operator, tle_line1=EXCLUDED.tle_line1, tle_line2=EXCLUDED.tle_line2 RETURNING id`,
+          [
+            noradId,
+            name,
+            category,
+            operator,
+            constellation,
+            gp.RCS_SIZE || null,
+            gp.TLE_LINE1 || null,
+            gp.TLE_LINE2 || null,
+          ]
+        )
+        const satId = satRes.rows[0].id
+        satIdMap.set(noradId, satId)
+
+        // Insert orbital elements from GP record
+        const epoch = gp.EPOCH || new Date().toISOString()
+        const sma = parseFloat(gp.SEMIMAJOR_AXIS || '0')
+        const altKm = sma ? sma - 6371 : parseFloat(gp.APOAPSIS || '0')
+        const ecc = parseFloat(gp.ECCENTRICITY || '0')
+        const incl = parseFloat(gp.INCLINATION || '0')
+        const raan = parseFloat(gp.RA_OF_ASC_NODE || '0')
+        const argP = parseFloat(gp.ARG_OF_PERICENTER || '0')
+        const ma = parseFloat(gp.MEAN_ANOMALY || '0')
+        const mm = parseFloat(gp.MEAN_MOTION || '0')
+        const bstar = parseFloat(gp.BSTAR || '0')
+        const velKms = sma ? Math.sqrt(398600.4418 / sma) : 7.5
+
+        await client.query(
+          `INSERT INTO orbital_elements (satellite_id, epoch, semi_major_axis, eccentricity, inclination, raan, arg_of_perigee, mean_anomaly, mean_motion, bstar, altitude_km, velocity_kms)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+           ON CONFLICT (satellite_id, epoch) DO NOTHING`,
+          [satId, epoch, sma, ecc, incl, raan, argP, ma, mm, bstar, altKm, velKms]
+        )
+      }
+
+      // Insert conjunction events from real CDMs
+      let insertedConj = 0
+      for (const cdm of cdms) {
+        const satAId = satIdMap.get(cdm.SAT_1_ID)
+        const satBId = satIdMap.get(cdm.SAT_2_ID)
+        if (!satAId || !satBId) continue
+        const pc = parseFloat(cdm.PC || '0')
+        const missM = parseFloat(cdm.MIN_RNG || '0') // Space-Track MIN_RNG is in meters
+        const missKm = missM / 1000
+        const riskTier = pc > 1e-3 ? 'red' : pc > 1e-4 ? 'amber' : 'green'
+        const maneuverRecommended = pc > 1e-4
+        const tca = cdm.TCA
+        const tcaDate = new Date(tca)
+        const maneuverOpen = new Date(tcaDate.getTime() - 48 * 3600000).toISOString()
+        const maneuverClose = new Date(tcaDate.getTime() - 6 * 3600000).toISOString()
+
+        await client.query(
+          `INSERT INTO conjunction_events (cdm_id, satellite_a_id, satellite_b_id, tca, miss_distance_km, raw_pc, ml_pc, risk_tier, maneuver_recommended, maneuver_window_open, maneuver_window_close, status, miss_distance_m, cdm_count, first_pc, max_pc)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,1,$6,$6)
+           ON CONFLICT (cdm_id) DO NOTHING`,
+          [
+            cdm.CDM_ID,
+            satAId,
+            satBId,
+            tca,
+            missKm,
+            pc,
+            pc,
+            riskTier,
+            maneuverRecommended,
+            maneuverOpen,
+            maneuverClose,
+            missM,
+          ]
+        )
+        insertedConj++
+
+        // AI recommendation per conjunction
+        const conjRes = await client.query(`SELECT id FROM conjunction_events WHERE cdm_id = $1`, [
+          cdm.CDM_ID,
+        ])
+        if (conjRes.rows.length > 0) {
+          const conjId = conjRes.rows[0].id
+          const recType =
+            pc > 1e-3
+              ? 'collision-avoidance'
+              : pc > 1e-4
+                ? 'conjunction-monitoring'
+                : 'orbital-adjustment'
+          const priority = pc > 1e-3 ? 'high' : pc > 1e-4 ? 'medium' : 'low'
+          const confidence = pc > 1e-3 ? 92 : pc > 1e-4 ? 78 : 65
+          const pcStr = pc > 0 ? `1:${Math.round(1 / pc).toLocaleString()}` : 'N/A'
+          const desc =
+            pc > 1e-3
+              ? `HIGH RISK: ${cdm.SAT_1_NAME} and ${cdm.SAT_2_NAME} conjunction at ${Math.round(missM).toLocaleString()} m miss distance. Pc=${pcStr} (18th SDS). ${cdm.EMERGENCY_REPORTABLE === 'Y' ? 'EMERGENCY REPORTABLE EVENT.' : ''} Recommend immediate maneuver assessment.`
+              : pc > 1e-4
+                ? `ELEVATED: ${cdm.SAT_1_NAME} × ${cdm.SAT_2_NAME} close approach. Pc=${pcStr}, miss distance ${Math.round(missM).toLocaleString()} m. Increase observation cadence and prepare contingency maneuver.`
+                : `MONITOR: ${cdm.SAT_1_NAME} near ${cdm.SAT_2_NAME}. Pc=${pcStr} at ${Math.round(missM).toLocaleString()} m. Standard tracking sufficient.`
+          await client.query(
+            `INSERT INTO ai_recommendations (conjunction_id, type, priority, description, confidence) VALUES ($1,$2,$3,$4,$5)`,
+            [conjId, recType, priority, desc, confidence]
+          )
+        }
+      }
+
+      // Insert tracking network sensors
+      const sensors = [
+        ['leo-radar-ak', 'LEO Radar Network (Alaska)', 'radar', 'Clear AFS, Alaska', 96, 4200],
+        ['polar-radar-scan', 'Polar Radar Array (Scandinavia)', 'radar', 'Vardø, Norway', 94, 3800],
+        ['optical-hi', 'Optical Network (Hawaii)', 'optical', 'Maui, Hawaii', 92, 2900],
+        ['optical-nm', 'Optical Network (New Mexico)', 'optical', 'Socorro, New Mexico', 90, 2600],
+        ['space-sensor', 'Space-Based Sensor (LEO, 630 km)', 'space-based', 'LEO Orbit', 98, 8500],
+        [
+          'southern-radar',
+          'Southern Hemisphere Radar (Australia)',
+          'radar',
+          'Pine Gap, Australia',
+          88,
+          3100,
+        ],
+        ['sband-radar', 'S-Band Radar (Alaska)', 'radar', 'Cobra Dane, Alaska', 95, 5200],
+        [
+          'equatorial-optical',
+          'Equatorial Optical Array (Diego Garcia)',
+          'optical',
+          'Diego Garcia',
+          91,
+          2400,
+        ],
+        ['cband-track', 'C-Band Tracking (Kwajalein)', 'radar', 'Kwajalein Atoll', 89, 1800],
+      ]
+      for (const [sensorId, sName, sType, loc, quality, tracking] of sensors) {
+        await client.query(
+          `INSERT INTO tracking_network (sensor_id, sensor_name, sensor_type, location, data_quality, tracking_objects, status)
+           VALUES ($1,$2,$3,$4,$5,$6,'active') ON CONFLICT (sensor_id) DO NOTHING`,
+          [sensorId, sName, sType, loc, quality, tracking]
+        )
+      }
+
+      await client.query('COMMIT')
+      const summary = {
+        ok: true,
+        source: 'Space-Track (18th SDS)',
+        satellites: gpData.length,
+        conjunctions: insertedConj,
+        totalCdms: rawCdms.length,
+        uniqueCdms: cdms.length,
+        highestPc: cdms[0]
+          ? `Pc=${parseFloat(cdms[0].PC).toFixed(6)} ${cdms[0].SAT_1_NAME} × ${cdms[0].SAT_2_NAME}`
+          : 'none',
+      }
+      console.log('[reseed] Complete:', summary)
+      res.json(summary)
+    } catch (err) {
+      await client.query('ROLLBACK')
+      throw err
+    } finally {
+      await client.end().catch(() => {})
+    }
+  } catch (err) {
+    console.error('/api/reseed error:', err)
+    res.status(500).json({ error: String(err) })
+  }
+})
+
+// GET /api/anomalies — anomaly events, optionally filtered by ?norad_ids=
+app.get('/api/anomalies', async (req, res) => {
+  try {
+    const { norad_ids } = req.query
+    const noradList =
+      typeof norad_ids === 'string'
+        ? norad_ids
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean)
+        : []
+    let noradFilter = ''
+    const params: unknown[] = []
+    if (noradList.length > 0) {
+      const placeholders = noradList.map((_, i) => `$${i + 1}`).join(',')
+      params.push(...noradList)
+      noradFilter = `WHERE ae.norad_id IN (${placeholders})`
+    }
+    const result = await query(
+      req,
+      `
+      SELECT
+        ae.id, ae.norad_id, ae.satellite_name, ae.anomaly_type, ae.severity,
+        ae.detected_at, ae.parameter_name, ae.expected_value, ae.observed_value,
+        ae.deviation_sigma, ae.anomaly_score, ae.description, ae.status
+      FROM anomaly_events ae
+      ${noradFilter}
+      ORDER BY
+        CASE ae.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+        ae.detected_at DESC
+      LIMIT 50
+    `,
+      params
+    )
+    res.json(result.rows)
+  } catch (err) {
+    console.error('GET /api/anomalies error:', err)
+    res.status(500).json({ error: 'Database error' })
+  }
+})
+
+// GET /api/anomalies/:id
+app.get('/api/anomalies/:id', async (req, res) => {
+  try {
+    const result = await query(req, 'SELECT * FROM anomaly_events WHERE id = $1', [req.params.id])
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (err) {
+    console.error('GET /api/anomalies/:id error:', err)
+    res.status(500).json({ error: 'Database error' })
+  }
+})
+
+// PATCH /api/anomalies/:id/status — update anomaly status
+app.patch('/api/anomalies/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body
+    if (!['active', 'investigating', 'resolved'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' })
+    }
+    const result = await query(
+      req,
+      'UPDATE anomaly_events SET status = $1 WHERE id = $2 RETURNING *',
+      [status, req.params.id]
+    )
+    res.json(result.rows[0])
+  } catch {
+    res.status(500).json({ error: 'Database error' })
+  }
+})
+
+// ─── Agentic AI Chat ─────────────────────────────────────────────────────────
+
+const AI_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'query_conjunctions',
+      description:
+        'Query upcoming conjunction events (TCA in the future), one row per event. Returns satellite pairs, Space-Track (18 SDS) and ML collision probabilities, miss distance in meters (miss_distance_m), risk tier, TCA, and how many CDM updates the event has had.',
+      parameters: {
+        type: 'object',
+        properties: {
+          risk_tier: {
+            type: 'string',
+            enum: ['red', 'amber', 'green'],
+            description: 'Filter by risk tier',
           },
-        })),
-        events: events.map((e: any) => ({
-          ...e,
-          satelliteIds: JSON.parse(e.satellite_ids),
-        })),
-        aiRecommendations: aiRecommendations.map((r: any) => ({
-          ...r,
-          affectedSensors: r.affected_sensors ? JSON.parse(r.affected_sensors) : undefined,
-          relatedEventId: r.related_event_id,
-        })),
-        telemetryData: telemetryData.length > 0 ? telemetryData : undefined,
-      }
-    })
+          limit: { type: 'number', description: 'Max results (default 10)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_ml_predictions',
+      description:
+        'Get XGBoost ML model predictions that recalibrate raw collision probabilities. Shows raw vs ML Pc, calibration ratio, and risk tier changes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'Max results (default 10)' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_satellite_info',
+      description:
+        'Get orbital parameters for a satellite by NORAD ID. Returns altitude, velocity, inclination, eccentricity, RAAN, and other orbital elements.',
+      parameters: {
+        type: 'object',
+        properties: {
+          norad_id: { type: 'string', description: 'NORAD catalog ID of the satellite' },
+        },
+        required: ['norad_id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'calculate_maneuver',
+      description:
+        'Calculate a collision avoidance maneuver for a conjunction. Estimates delta-V, fuel cost, and post-maneuver collision probability.',
+      parameters: {
+        type: 'object',
+        properties: {
+          conjunction_id: { type: 'string', description: 'Conjunction event ID or CDM ID' },
+          maneuver_type: {
+            type: 'string',
+            enum: ['in-track', 'radial', 'cross-track'],
+            description: 'Type of maneuver (default: in-track)',
+          },
+          lead_time_hours: {
+            type: 'number',
+            description: 'Hours before TCA to execute (default: 24)',
+          },
+        },
+        required: ['conjunction_id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_risk_summary',
+      description:
+        'Get aggregate risk statistics across all tracked conjunctions — counts by risk tier, average collision probability, closest approach.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+]
 
-    res.json(toCamelCase(scenariosWithData))
-  } catch (error) {
-    console.error('Error fetching scenarios:', error)
-    res.status(500).json({ error: 'Failed to fetch scenarios' })
+async function executeToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  pgPassword: string
+): Promise<string> {
+  const pgClient = new Client({
+    host: process.env.PGHOST,
+    port: parseInt(process.env.PGPORT || '5432'),
+    database: process.env.PGDATABASE || 'orbitwatch',
+    user: process.env.PGUSER || process.env.DATABRICKS_CLIENT_ID || 'will.yuponce@databricks.com',
+    password: pgPassword,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 8000,
+    query_timeout: 15000,
+  })
+  await pgClient.connect()
+  try {
+    switch (toolName) {
+      case 'query_conjunctions': {
+        const tier = args.risk_tier as string | undefined
+        const limit = (args.limit as number) || 10
+        const params: unknown[] = [limit]
+        let filter = ''
+        if (tier) {
+          params.push(tier)
+          filter = `WHERE ce.risk_tier = $2`
+        }
+        params.push(nowIso())
+        const upcoming = `ce.tca >= $${params.length}`
+        filter = filter ? `${filter} AND ${upcoming}` : `WHERE ${upcoming}`
+        const r = await pgClient.query(
+          `
+          SELECT ce.id, ce.cdm_id, ce.tca, ce.miss_distance_m, ce.raw_pc, ce.ml_pc, ce.risk_tier,
+                 ce.maneuver_recommended, ce.cdm_count, ce.first_pc,
+                 sa.name as sat_a, sa.norad_id as norad_a,
+                 sb.name as sat_b, sb.norad_id as norad_b
+          FROM conjunction_events ce
+          JOIN satellites sa ON ce.satellite_a_id = sa.id
+          JOIN satellites sb ON ce.satellite_b_id = sb.id
+          ${filter} ORDER BY ce.ml_pc DESC NULLS LAST LIMIT $1
+        `,
+          params
+        )
+        return JSON.stringify(r.rows)
+      }
+      case 'get_ml_predictions': {
+        const limit = (args.limit as number) || 10
+        // Served from the Lakebase copy first; the warehouse query is a fallback.
+        try {
+          const r = await pgClient.query(
+            `
+            SELECT sat_1_name, sat_2_name, raw_pc, ml_pc, calibration_ratio, raw_risk_tier,
+                   ml_risk_tier, risk_changed, miss_distance_km
+            FROM ml_predictions ORDER BY ml_pc DESC NULLS LAST LIMIT $1
+          `,
+            [limit]
+          )
+          if (r.rows.length > 0) return JSON.stringify(r.rows)
+        } catch {
+          /* ml_predictions not loaded yet */
+        }
+        const host = process.env.DATABRICKS_HOST || ''
+        const token = await getM2MToken()
+        const baseUrl = host.startsWith('http') ? host : `https://${host}`
+        const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
+        const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            statement: `SELECT sat_1_name, sat_2_name, raw_pc, ml_pc, calibration_ratio, raw_risk_tier, ml_risk_tier, risk_changed, miss_distance_km FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.conjunction_predictions ORDER BY ml_pc DESC LIMIT ${limit}`,
+            warehouse_id: wh,
+            format: 'JSON_ARRAY',
+            wait_timeout: '30s',
+          }),
+        })
+        const sqlData = (await sqlResp.json()) as {
+          manifest?: { schema?: { columns?: { name: string }[] } }
+          result?: { data_array?: unknown[][] }
+        }
+        const cols = sqlData.manifest?.schema?.columns?.map(c => c.name) || []
+        const rows = (sqlData.result?.data_array || []).map(row => {
+          const obj: Record<string, unknown> = {}
+          cols.forEach((c, i) => (obj[c] = row[i]))
+          return obj
+        })
+        return JSON.stringify(rows)
+      }
+      case 'get_satellite_info': {
+        const noradId = args.norad_id as string
+        const r = await pgClient.query(
+          `
+          SELECT s.name, s.norad_id, s.category, s.operator, s.constellation,
+                 oe.altitude_km, oe.velocity_kms, oe.inclination, oe.eccentricity,
+                 oe.raan, oe.semi_major_axis, oe.mean_motion, oe.epoch
+          FROM satellites s
+          LEFT JOIN LATERAL (SELECT * FROM orbital_elements WHERE satellite_id = s.id ORDER BY epoch DESC LIMIT 1) oe ON true
+          WHERE s.norad_id = $1
+        `,
+          [noradId]
+        )
+        return r.rows.length > 0
+          ? JSON.stringify(r.rows[0])
+          : JSON.stringify({ error: 'Satellite not found' })
+      }
+      case 'calculate_maneuver': {
+        const conjId = args.conjunction_id as string
+        const maneuverType = (args.maneuver_type as string) || 'in-track'
+        const leadTimeH = (args.lead_time_hours as number) || 24
+        const isSmall = /^\d+$/.test(conjId) && parseInt(conjId) < 100000
+        const where = isSmall ? 'ce.id = $1' : 'ce.cdm_id = $1'
+        const r = await pgClient.query(
+          `
+          SELECT ce.*, sa.name as sat_a_name, sb.name as sat_b_name
+          FROM conjunction_events ce
+          JOIN satellites sa ON ce.satellite_a_id = sa.id
+          JOIN satellites sb ON ce.satellite_b_id = sb.id
+          WHERE ${where}
+        `,
+          [conjId]
+        )
+        if (r.rows.length === 0) return JSON.stringify({ error: 'Conjunction not found' })
+        const conj = r.rows[0]
+        const missM = num(conj.miss_distance_m) ?? parseFloat(conj.miss_distance_km) * 1000
+        const missKm = missM / 1000
+        const pc = parseFloat(conj.ml_pc || conj.raw_pc)
+        // Simplified Hohmann-ish maneuver calculation
+        const targetSeparationKm = Math.max(missKm * 5, 5) // aim for 5x current miss distance or 5 km
+        const deltaV = (targetSeparationKm / (leadTimeH * 3600)) * 1000 // m/s rough estimate
+        const fuelKg = deltaV * 0.1 // ~100kg sat, Isp~300s simplified
+        const postPc = pc * Math.exp(-targetSeparationKm / missKm) // exponential reduction
+        return JSON.stringify({
+          conjunction: `${conj.sat_a_name} × ${conj.sat_b_name}`,
+          current_miss_distance_m: Math.round(missM),
+          current_miss_distance_km: missKm,
+          current_pc: pc,
+          maneuver_type: maneuverType,
+          lead_time_hours: leadTimeH,
+          delta_v_ms: parseFloat(deltaV.toFixed(3)),
+          estimated_fuel_kg: parseFloat(fuelKg.toFixed(2)),
+          post_maneuver_miss_km: parseFloat(targetSeparationKm.toFixed(1)),
+          post_maneuver_pc: parseFloat(postPc.toExponential(3)),
+          recommendation:
+            deltaV < 0.1
+              ? 'Low-cost maneuver, recommend execution'
+              : deltaV < 1.0
+                ? 'Moderate cost, evaluate against risk'
+                : 'High delta-V, consider alternative timing',
+        })
+      }
+      case 'get_risk_summary': {
+        const r = await pgClient.query(
+          `
+          SELECT risk_tier, COUNT(*) as count,
+                 AVG(ml_pc) as avg_pc, MIN(miss_distance_m) as min_miss_m,
+                 COUNT(*) FILTER (WHERE maneuver_recommended) as maneuver_count
+          FROM conjunction_events WHERE status = 'active' AND tca >= $1
+          GROUP BY risk_tier ORDER BY CASE risk_tier WHEN 'red' THEN 1 WHEN 'amber' THEN 2 ELSE 3 END
+        `,
+          [nowIso()]
+        )
+        const total = r.rows.reduce((s: number, r: { count: string }) => s + parseInt(r.count), 0)
+        return JSON.stringify({ tiers: r.rows, total_active: total })
+      }
+      default:
+        return JSON.stringify({ error: `Unknown tool: ${toolName}` })
+    }
+  } finally {
+    await pgClient.end().catch(() => {})
+  }
+}
+
+// POST /api/chat — Agentic AI chat with tool calling
+app.post('/api/chat', async (req, res) => {
+  if (isLocalMode) {
+    return res.json({
+      role: 'assistant',
+      content:
+        'AI chat requires a Databricks connection. Running in local demo mode with pre-seeded SQLite data. All other endpoints (conjunctions, satellites, anomalies, tracking, etc.) are fully functional.',
+    })
+  }
+  try {
+    const { messages } = req.body as { messages: Array<{ role: string; content: string }> }
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'messages array required' })
+    }
+
+    const host = process.env.DATABRICKS_HOST || ''
+    const baseUrl = host.startsWith('http') ? host : `https://${host}`
+    const token = await getM2MToken()
+    const pgPassword = await getPgPassword(req)
+
+    const systemPrompt = `You are OrbitWatch AI, an expert satellite conjunction analyst powered by Databricks. You have access to real Space-Track CDM data, XGBoost ML predictions, and orbital mechanics tools.
+
+Your capabilities:
+- Query active conjunction events with collision probabilities and risk tiers
+- Access ML model predictions that recalibrate raw Pc values using XGBoost
+- Look up satellite orbital parameters (altitude, velocity, inclination, etc.)
+- Calculate collision avoidance maneuvers (delta-V, fuel cost, timing)
+- Provide aggregate risk summaries across the constellation
+
+Be concise and data-driven. Use tools to back up your analysis with real data. When discussing collision probability, express Pc as "1:X" ratios (e.g., 1:4,000) and say whether it is the Space-Track (18 SDS) value or the ML estimate. Miss distances are in meters (miss_distance_m). Tools return only upcoming events; an event whose TCA has passed is no longer actionable. Flag any red-tier conjunctions prominently. If a maneuver is recommended, explain the trade-offs. A human operator makes every maneuver decision: recommend, never claim to execute.
+
+Current time: ${new Date().toISOString()}`
+
+    const fullMessages = [{ role: 'system', content: systemPrompt }, ...messages]
+
+    // Agentic loop: iterate until no more tool calls
+    const currentMessages = fullMessages
+    let iterations = 0
+    const MAX_ITERATIONS = 5
+
+    while (iterations < MAX_ITERATIONS) {
+      iterations++
+      // Claude 5.x endpoints reject `temperature`, so it is not sent.
+      const chatResp = await fetch(`${baseUrl}/serving-endpoints/${chatModel()}/invocations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: currentMessages,
+          tools: AI_TOOLS,
+          max_tokens: 2048,
+        }),
+      })
+
+      if (!chatResp.ok) {
+        const errText = await chatResp.text()
+        console.error('[chat] LLM error:', chatResp.status, errText)
+        return res.status(502).json({ error: 'AI service unavailable', detail: errText })
+      }
+
+      const chatData = (await chatResp.json()) as {
+        choices: Array<{
+          message: {
+            role: string
+            content: string | null
+            tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>
+          }
+          finish_reason: string
+        }>
+      }
+
+      const choice = chatData.choices?.[0]
+      if (!choice) return res.status(502).json({ error: 'Empty AI response' })
+
+      const assistantMsg = choice.message
+      currentMessages.push(assistantMsg as (typeof currentMessages)[0])
+
+      // If no tool calls, we're done
+      if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+        return res.json({ role: 'assistant', content: (assistantMsg.content || '').trim() })
+      }
+
+      // Execute tool calls and add results
+      for (const tc of assistantMsg.tool_calls) {
+        const fnName =
+          typeof tc.function === 'object'
+            ? tc.function.name
+            : (tc as unknown as Record<string, { name: string }>).function?.name
+        const fnArgs = typeof tc.function === 'object' ? tc.function.arguments : '{}'
+        let args: Record<string, unknown> = {}
+        try {
+          args = JSON.parse(typeof fnArgs === 'string' ? fnArgs : JSON.stringify(fnArgs))
+        } catch {
+          /* empty */
+        }
+
+        console.log(`[chat] Tool call: ${fnName}(${JSON.stringify(args)})`)
+        let result: string
+        try {
+          result = await executeToolCall(fnName, args, pgPassword)
+        } catch (err) {
+          result = JSON.stringify({ error: String(err) })
+        }
+
+        currentMessages.push({
+          role: 'tool',
+          content: result,
+          // @ts-expect-error tool_call_id needed for OpenAI-compat
+          tool_call_id: tc.id,
+        })
+      }
+    }
+
+    // If we hit max iterations, return last assistant message
+    const lastAssistant = currentMessages.filter(m => m.role === 'assistant').pop()
+    res.json({ role: 'assistant', content: lastAssistant?.content || 'Analysis complete.' })
+  } catch (err) {
+    console.error('[chat] Error:', err)
+    res.status(500).json({ error: 'Chat failed', detail: String(err) })
   }
 })
 
-// Get single scenario by ID
-app.get('/api/scenarios/:id', (req, res) => {
+// GET /api/alerts — red/amber tier active conjunctions for alert FAB
+app.get('/api/alerts', async (req, res) => {
   try {
-    const scenario = db.prepare('SELECT * FROM scenarios WHERE id = ?').get(req.params.id) as any
+    const result = await query(
+      req,
+      `
+      SELECT ce.id, ce.cdm_id, ce.tca, ce.miss_distance_km, ce.miss_distance_m, ce.raw_pc, ce.ml_pc,
+             ce.risk_tier, sa.name as sat_a_name, sb.name as sat_b_name
+      FROM conjunction_events ce
+      JOIN satellites sa ON ce.satellite_a_id = sa.id
+      JOIN satellites sb ON ce.satellite_b_id = sb.id
+      WHERE ce.risk_tier IN ('red', 'amber') AND ce.status = 'active' AND ce.tca >= $1
+      ORDER BY CASE ce.risk_tier WHEN 'red' THEN 0 ELSE 1 END, ce.ml_pc DESC
+      LIMIT 20
+    `,
+      [nowIso()]
+    )
+    res.json(
+      result.rows.map(r => {
+        const missM = num(r.miss_distance_m)
+        return {
+          id: String(r.id),
+          cdmId: r.cdm_id,
+          tca: r.tca,
+          missDistanceKm: missM !== null ? missM / 1000 : num(r.miss_distance_km),
+          missDistanceM: missM,
+          rawPc: num(r.raw_pc),
+          mlPc: num(r.ml_pc),
+          riskTier: r.risk_tier,
+          satA: r.sat_a_name,
+          satB: r.sat_b_name,
+        }
+      })
+    )
+  } catch (err) {
+    console.error('GET /api/alerts error:', err)
+    res.json([])
+  }
+})
 
-    if (!scenario) {
-      return res.status(404).json({ error: 'Scenario not found' })
-    }
+// ─── ML Model Insights ────────────────────────────────────────────────────────
 
-    // Get satellites
-    const satellites = db.prepare(`
-      SELECT s.* FROM satellites s
-      JOIN scenario_satellites ss ON s.id = ss.satellite_id
-      WHERE ss.scenario_id = ?
-    `).all(scenario.id)
-
-    // Get events
-    const events = db.prepare('SELECT * FROM events WHERE scenario_id = ?').all(scenario.id)
-
-    // Get AI recommendations
-    const aiRecommendations = db.prepare('SELECT * FROM ai_recommendations WHERE scenario_id = ?').all(scenario.id)
-
-    // Get telemetry data
-    const telemetryData = db.prepare('SELECT * FROM telemetry_data WHERE scenario_id = ?').all(scenario.id)
-
-    const result = {
-      ...scenario,
-      tags: JSON.parse(scenario.tags),
-      satellites: satellites.map((sat: any) => ({
-        ...sat,
-        selected: sat.selected === 1,
-        orbitalParams: {
-          semiMajorAxis: sat.semi_major_axis,
-          eccentricity: sat.eccentricity,
-          inclination: sat.inclination,
-          raan: sat.raan,
-          argOfPerigee: sat.arg_of_perigee,
-          trueAnomaly: sat.true_anomaly,
-        },
-      })),
-      events: events.map((e: any) => ({
-        ...e,
-        satelliteIds: JSON.parse(e.satellite_ids),
-      })),
-      aiRecommendations: aiRecommendations.map((r: any) => ({
+// GET /api/ml/predictions — XGBoost inference results from Delta
+app.get('/api/ml/predictions', async (req, res) => {
+  if (isLocalMode) {
+    // Return mock ML predictions from local conjunction data
+    try {
+      const rows = localDb!
+        .prepare(
+          `
+        SELECT ce.cdm_id, sa.name as sat_1_name, sa.norad_id as sat_1_norad_id,
+               sb.name as sat_2_name, sb.norad_id as sat_2_norad_id,
+               ce.raw_pc, ce.ml_pc, ce.miss_distance_km, ce.risk_tier as ml_risk_tier, ce.risk_tier as raw_risk_tier,
+               CASE WHEN ce.raw_pc != ce.ml_pc THEN 1 ELSE 0 END as risk_changed
+        FROM conjunction_events ce
+        JOIN satellites sa ON ce.satellite_a_id = sa.id
+        JOIN satellites sb ON ce.satellite_b_id = sb.id
+        WHERE ce.status = 'active'
+        ORDER BY ce.ml_pc DESC LIMIT 50
+      `
+        )
+        .all() as Record<string, unknown>[]
+      const predictions = rows.map(r => ({
         ...r,
-        affectedSensors: r.affected_sensors ? JSON.parse(r.affected_sensors) : undefined,
-        relatedEventId: r.related_event_id,
-      })),
-      telemetryData: telemetryData.length > 0 ? telemetryData : undefined,
+        calibration_ratio: r.raw_pc && r.ml_pc ? Number(r.ml_pc) / Number(r.raw_pc) : 1.0,
+      }))
+      return res.json(predictions)
+    } catch (err) {
+      console.error('GET /api/ml/predictions local error:', err)
+      return res.json([])
+    }
+  }
+  try {
+    const { norad_ids, limit = 50 } = req.query
+    const noradList = typeof norad_ids === 'string' ? norad_ids.split(',').filter(Boolean) : []
+    const params: unknown[] = [limit]
+    let filter = ''
+    if (noradList.length > 0) {
+      const ph = noradList.map((_, i) => `$${i + 2}`).join(',')
+      params.push(...noradList)
+      filter = `WHERE (sat_1_norad_id IN (${ph}) OR sat_2_norad_id IN (${ph}))`
+    }
+    // Lakebase copy first (loaded by db/reverse_etl.py): no warehouse round
+    // trip, and no Unity Catalog grants needed for the app's service principal.
+    try {
+      const r = await query(
+        req,
+        `SELECT * FROM ml_predictions ${filter} ORDER BY ml_pc DESC NULLS LAST LIMIT $1`,
+        params
+      )
+      if (r.rows.length > 0) return res.json(r.rows)
+    } catch {
+      /* not loaded yet: fall back to the warehouse */
+    }
+    const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
+    const host = process.env.DATABRICKS_HOST || ''
+    const token = await getM2MToken()
+    const baseUrl = host.startsWith('http') ? host : `https://${host}`
+    const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        statement: `SELECT * FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.conjunction_predictions ${filter} ORDER BY ml_pc DESC LIMIT ${limit}`,
+        warehouse_id: wh,
+        format: 'JSON_ARRAY',
+        wait_timeout: '30s',
+      }),
+    })
+    if (!sqlResp.ok) throw new Error(`SQL API ${sqlResp.status}`)
+    const sqlData = (await sqlResp.json()) as {
+      manifest?: { schema?: { columns?: { name: string }[] } }
+      result?: { data_array?: unknown[][] }
+    }
+    const cols = sqlData.manifest?.schema?.columns?.map((c: { name: string }) => c.name) || []
+    const rows = (sqlData.result?.data_array || []).map((row: unknown[]) => {
+      const obj: Record<string, unknown> = {}
+      cols.forEach((c: string, i: number) => (obj[c] = row[i]))
+      return obj
+    })
+    res.json(rows)
+  } catch (err) {
+    console.error('GET /api/ml/predictions error:', err)
+    res.json([]) // graceful fallback
+  }
+})
+
+// GET /api/ml/summary — model performance summary
+app.get('/api/ml/summary', async (req, res) => {
+  if (isLocalMode) {
+    return res.json({
+      model_name: 'xgboost_conjunction_v3',
+      model_version: '1.2.0',
+      trained_at: new Date(Date.now() - 7 * 86400000).toISOString(),
+      training_samples: 48250,
+      features: 12,
+      accuracy: 0.943,
+      precision_score: 0.912,
+      recall: 0.887,
+      f1_score: 0.899,
+      auc_roc: 0.961,
+      log_loss: 0.142,
+      note: 'Local demo mode -- mock model summary',
+    })
+  }
+  try {
+    try {
+      const r = await query(req, 'SELECT * FROM ml_model_summary ORDER BY trained_at DESC LIMIT 1')
+      if (r.rows.length > 0) return res.json(r.rows[0])
+    } catch {
+      /* not loaded yet: fall back to the warehouse */
+    }
+    const host = process.env.DATABRICKS_HOST || ''
+    const token = await getM2MToken()
+    const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
+    const baseUrl = host.startsWith('http') ? host : `https://${host}`
+    const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        statement: `SELECT * FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.model_summary ORDER BY trained_at DESC LIMIT 1`,
+        warehouse_id: wh,
+        format: 'JSON_ARRAY',
+        wait_timeout: '30s',
+      }),
+    })
+    if (!sqlResp.ok) throw new Error(`SQL API ${sqlResp.status}`)
+    const sqlData = (await sqlResp.json()) as {
+      manifest?: { schema?: { columns?: { name: string }[] } }
+      result?: { data_array?: unknown[][] }
+    }
+    const cols = sqlData.manifest?.schema?.columns?.map((c: { name: string }) => c.name) || []
+    const rows = (sqlData.result?.data_array || []).map((row: unknown[]) => {
+      const obj: Record<string, unknown> = {}
+      cols.forEach((c: string, i: number) => (obj[c] = row[i]))
+      return obj
+    })
+    res.json(rows[0] || null)
+  } catch (err) {
+    console.error('GET /api/ml/summary error:', err)
+    res.json(null)
+  }
+})
+
+// In-memory TLE cache (1 hour TTL)
+let tleCache: { data: unknown[]; ts: number } | null = null
+const TLE_CACHE_TTL = 60 * 60 * 1000 // 1 hour
+
+app.get('/api/satellites/tle', async (req, res) => {
+  try {
+    // Return cached if fresh
+    if (tleCache && Date.now() - tleCache.ts < TLE_CACHE_TTL) {
+      return res.json(tleCache.data)
     }
 
-    res.json(toCamelCase(result))
-  } catch (error) {
-    console.error('Error fetching scenario:', error)
-    res.status(500).json({ error: 'Failed to fetch scenario' })
-  }
-})
-
-// Get threat objects
-app.get('/api/threats', (req, res) => {
-  try {
-    const threats = db.prepare('SELECT * FROM threat_objects').all()
-
-    const threatsWithData = threats.map((threat: any) => {
-      const maneuverHistory = db.prepare('SELECT * FROM maneuver_history WHERE threat_object_id = ?').all(threat.id)
-      const capabilities = db.prepare('SELECT * FROM threat_capabilities WHERE threat_object_id = ?').all(threat.id)
-
-      return {
-        ...threat,
-        selected: threat.selected === 1,
-        orbitalParams: {
-          semiMajorAxis: threat.semi_major_axis,
-          eccentricity: threat.eccentricity,
-          inclination: threat.inclination,
-          raan: threat.raan,
-          argOfPerigee: threat.arg_of_perigee,
-          trueAnomaly: threat.true_anomaly,
-        },
-        maneuverHistory: maneuverHistory.map((m: any) => ({
-          timestamp: m.timestamp,
-          deltaV: m.delta_v,
-          description: m.description,
-          assessed: m.assessed,
-        })),
-        capabilities: capabilities.map((c: any) => ({
-          type: c.type,
-          detectionConfidence: c.detection_confidence,
-          effectiveRange: c.effective_range,
-          lastObserved: c.last_observed,
-        })),
-        targetedAssets: threat.targeted_assets ? JSON.parse(threat.targeted_assets) : [],
-      }
-    })
-
-    res.json(toCamelCase(threatsWithData))
-  } catch (error) {
-    console.error('Error fetching threats:', error)
-    res.status(500).json({ error: 'Failed to fetch threats' })
-  }
-})
-
-// Get EW threats
-app.get('/api/ew-threats', (req, res) => {
-  try {
-    const threats = db.prepare('SELECT * FROM ew_threats').all()
-    const threatsWithParsedFields = threats.map((t: any) => ({
-      ...t,
-      affectedFrequencies: JSON.parse(t.affected_frequencies),
-      affectedSatellites: JSON.parse(t.affected_satellites),
-      sourceLocation: t.source_latitude && t.source_longitude ? {
-        latitude: t.source_latitude,
-        longitude: t.source_longitude,
-        groundStation: t.ground_station,
-      } : undefined,
-      classification: {
-        level: t.classification_level,
-        caveats: t.classification_caveats ? JSON.parse(t.classification_caveats) : undefined,
-        sciControls: t.classification_sci_controls ? JSON.parse(t.classification_sci_controls) : undefined,
-      },
+    // Read TLEs directly from Lakebase (stored from Space-Track GP data)
+    const result = await query(
+      req,
+      'SELECT norad_id, name, tle_line1, tle_line2 FROM satellites WHERE tle_line1 IS NOT NULL AND tle_line2 IS NOT NULL ORDER BY id'
+    )
+    type TleRow = { norad_id: string; name: string; tle_line1: string; tle_line2: string }
+    const valid = (result.rows as TleRow[]).map(r => ({
+      noradId: r.norad_id,
+      name: r.name,
+      tleName: r.name,
+      line1: r.tle_line1,
+      line2: r.tle_line2,
     }))
 
-    res.json(toCamelCase(threatsWithParsedFields))
-  } catch (error) {
-    console.error('Error fetching EW threats:', error)
-    res.status(500).json({ error: 'Failed to fetch EW threats' })
+    tleCache = { data: valid, ts: Date.now() }
+    res.json(valid)
+  } catch (err) {
+    console.error('GET /api/satellites/tle error:', err)
+    res.status(500).json({ error: 'Failed to fetch TLEs' })
   }
 })
 
-// Get C2 alerts
-app.get('/api/c2-alerts', (req, res) => {
+app.get('/api/timeline', async (req, res) => {
   try {
-    const alerts = db.prepare('SELECT * FROM c2_alerts').all()
-    const alertsWithParsedFields = alerts.map((a: any) => ({
-      ...a,
-      affectedAssets: JSON.parse(a.affected_assets),
-      recommendedActions: JSON.parse(a.recommended_actions),
-      disseminationList: JSON.parse(a.dissemination_list),
-      classification: {
-        level: a.classification_level,
-        caveats: a.classification_caveats ? JSON.parse(a.classification_caveats) : undefined,
-        sciControls: a.classification_sci_controls ? JSON.parse(a.classification_sci_controls) : undefined,
-      },
-      acknowledgedBy: a.acknowledged_by ? JSON.parse(a.acknowledged_by) : undefined,
-    }))
+    const [conjResult, anomResult] = await Promise.all([
+      query(
+        req,
+        `
+        SELECT
+          'conjunction' as event_type,
+          ce.id,
+          ce.cdm_id,
+          ce.tca as event_time,
+          ce.miss_distance_km,
+          ce.ml_pc,
+          ce.risk_tier,
+          ce.status,
+          sa.name as sat_a_name,
+          sb.name as sat_b_name,
+          ce.created_at
+        FROM conjunction_events ce
+        JOIN satellites sa ON ce.satellite_a_id = sa.id
+        JOIN satellites sb ON ce.satellite_b_id = sb.id
+        ORDER BY ce.tca DESC
+        LIMIT 20
+      `
+      ),
+      query(
+        req,
+        `
+        SELECT
+          'anomaly' as event_type,
+          ae.id,
+          NULL as cdm_id,
+          ae.detected_at as event_time,
+          NULL as miss_distance_km,
+          ae.anomaly_score as ml_pc,
+          ae.severity as risk_tier,
+          ae.status,
+          ae.satellite_name as sat_a_name,
+          NULL as sat_b_name,
+          ae.anomaly_type,
+          ae.parameter_name,
+          ae.deviation_sigma,
+          ae.description,
+          ae.created_at
+        FROM anomaly_events ae
+        ORDER BY ae.detected_at DESC
+        LIMIT 20
+      `
+      ),
+    ])
 
-    res.json(toCamelCase(alertsWithParsedFields))
-  } catch (error) {
-    console.error('Error fetching C2 alerts:', error)
-    res.status(500).json({ error: 'Failed to fetch C2 alerts' })
+    const events = [
+      ...conjResult.rows.map(r => ({
+        type: 'conjunction',
+        id: String(r.id),
+        cdmId: r.cdm_id,
+        eventTime: r.event_time,
+        label: `${r.sat_a_name} × ${r.sat_b_name}`,
+        sublabel: r.miss_distance_km
+          ? `Miss ${Number(r.miss_distance_km).toFixed(3)} km · Pc 1:${r.ml_pc > 0 ? Math.round(1 / r.ml_pc).toLocaleString() : 'N/A'}`
+          : '',
+        severity: r.risk_tier,
+        status: r.status,
+      })),
+      ...anomResult.rows.map(r => ({
+        type: 'anomaly',
+        id: String(r.id),
+        eventTime: r.event_time,
+        label: r.sat_a_name,
+        sublabel: `${r.anomaly_type?.replace(/-/g, ' ')} · ${Number(r.deviation_sigma || 0).toFixed(1)}σ deviation`,
+        severity: r.risk_tier,
+        status: r.status,
+        description: r.description,
+      })),
+    ].sort((a, b) => new Date(b.eventTime).getTime() - new Date(a.eventTime).getTime())
+
+    res.json(events)
+  } catch (err) {
+    console.error('GET /api/timeline error:', err)
+    res.status(500).json({ error: 'Failed to fetch timeline' })
   }
 })
 
-// Get SSN data sources
-app.get('/api/ssn-sources', (req, res) => {
-  try {
-    const sources = db.prepare('SELECT * FROM ssn_data_sources').all()
-    res.json(toCamelCase(sources))
-  } catch (error) {
-    console.error('Error fetching SSN sources:', error)
-    res.status(500).json({ error: 'Failed to fetch SSN sources' })
-  }
+// Serve React app in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(process.cwd(), 'dist')))
+  app.get('/{*splat}', (req, res) => {
+    res.sendFile(path.join(process.cwd(), 'dist/index.html'))
+  })
+}
+
+localDbReady.then(() => {
+  app.listen(PORT, () => {
+    console.log(`OrbitWatch server running on port ${PORT}`)
+  })
 })
 
-// Get user profiles
-app.get('/api/users', (req, res) => {
-  try {
-    const users = db.prepare('SELECT * FROM user_profiles').all()
-    const usersWithParsedFields = users.map((u: any) => ({
-      ...u,
-      sciAccess: JSON.parse(u.sci_access),
-      needToKnow: JSON.parse(u.need_to_know),
-    }))
-
-    res.json(toCamelCase(usersWithParsedFields))
-  } catch (error) {
-    console.error('Error fetching users:', error)
-    res.status(500).json({ error: 'Failed to fetch users' })
-  }
-})
-
-// Serve static frontend files in production
-app.use(express.static(path.join(__dirname, '../../dist')))
-
-// Catch-all route to serve index.html for client-side routing
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../../dist/index.html'))
-})
-
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`)
-  console.log(`📊 API available at http://localhost:${PORT}/api`)
-})
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  db.close()
-  process.exit(0)
-})
-
+export default app
