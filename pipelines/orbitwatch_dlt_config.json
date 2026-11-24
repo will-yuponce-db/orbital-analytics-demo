@@ -1,0 +1,12 @@
+{
+  "name": "OrbitWatch - Space Domain Awareness Pipeline",
+  "catalog": "stable_demo_wy_catalog",
+  "target": "orbitwatch",
+  "serverless": true,
+  "development": true,
+  "libraries": [
+    { "notebook": { "path": "pipelines/bronze_spacetrack_ingestion" } },
+    { "notebook": { "path": "pipelines/silver_conjunction_features" } },
+    { "notebook": { "path": "pipelines/gold_risk_scoring" } }
+  ]
+}

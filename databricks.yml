@@ -1,0 +1,79 @@
+bundle:
+  name: orbitwatch
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://fevm-will-wy-demo.cloud.databricks.com
+      profile: fevm-will-wy-demo
+
+  dod:
+    mode: development
+    workspace:
+      host: https://fevm-dod-commercial.cloud.databricks.com
+      profile: fe-vm-dod-commercial
+    variables:
+      catalog: demo_cg_catalog
+      spacetrack_user: "{{secrets/orbitwatch/spacetrack_user}}"
+      spacetrack_pass: "{{secrets/orbitwatch/spacetrack_pass}}"
+
+variables:
+  catalog:
+    default: will_wy_demo_catalog
+  # Space-Track credentials come from secret scope `orbitwatch` in every target.
+  # Never put the literal password here.
+  spacetrack_user:
+    default: "{{secrets/orbitwatch/spacetrack_user}}"
+  spacetrack_pass:
+    default: "{{secrets/orbitwatch/spacetrack_pass}}"
+
+resources:
+  pipelines:
+    orbitwatch_pipeline:
+      name: "OrbitWatch — Conjunction Data Pipeline"
+      development: true
+      continuous: false
+      serverless: true
+      catalog: ${var.catalog}
+      schema: orbitwatch_dlt
+      configuration:
+        spark.spacetrack.user: ${var.spacetrack_user}
+        spark.spacetrack.pass: ${var.spacetrack_pass}
+      libraries:
+        - notebook:
+            path: ./pipelines/orbitwatch_full_pipeline.py
+
+  jobs:
+    orbitwatch_ingestion_job:
+      name: "OrbitWatch — Scheduled Ingestion (6h)"
+      schedule:
+        quartz_cron_expression: "0 0 */6 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: run_conjunction_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.orbitwatch_pipeline.id}
+      email_notifications:
+        on_failure:
+          - will.yuponce@databricks.com
+
+    orbitwatch_ml_training_job:
+      name: "OrbitWatch — ML Train + Score"
+      tasks:
+        - task_key: train_and_score
+          notebook_task:
+            notebook_path: ./ml/train_and_score.py
+            base_parameters:
+              catalog: ${var.catalog}
+          environment_key: ml_env
+      environments:
+        - environment_key: ml_env
+          spec:
+            client: "1"
+            dependencies:
+              - xgboost
+              - scikit-learn
+              - mlflow
