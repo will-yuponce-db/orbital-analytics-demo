@@ -75,7 +75,10 @@ ALTER TABLE conjunction_events
   ADD COLUMN IF NOT EXISTS first_pc DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS max_pc DOUBLE PRECISION,
   ADD COLUMN IF NOT EXISTS pc_history JSONB,
-  ADD COLUMN IF NOT EXISTS cdm_created_at TIMESTAMP
+  ADD COLUMN IF NOT EXISTS cdm_created_at TIMESTAMP;
+ALTER TABLE satellites
+  ADD COLUMN IF NOT EXISTS tle_line1 TEXT,
+  ADD COLUMN IF NOT EXISTS tle_line2 TEXT
 """
 
 def pg_config():
@@ -213,7 +216,7 @@ def main():
         SELECT norad_id, name, operator, category, rcs_size, epoch,
                semi_major_axis, eccentricity, inclination, raan, arg_of_perigee,
                mean_anomaly, mean_motion, bstar, altitude_km, velocity_kms,
-               orbit_regime
+               orbit_regime, tle_line1, tle_line2
         FROM {CATALOG}.{DLT_SCHEMA}.silver_satellites
     """)
     print(f"  silver_satellites: {len(sats)} rows")
@@ -305,10 +308,12 @@ def main():
         norad_to_id = {}
         for nid, s in {**extra, **sat_by_norad}.items():
             cur.execute(
-                """INSERT INTO satellites (norad_id, name, operator, constellation, category, rcs_size)
-                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                """INSERT INTO satellites (norad_id, name, operator, constellation, category,
+                                          rcs_size, tle_line1, tle_line2)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (nid, (s.get("name") or f"OBJ-{nid}")[:100], s.get("operator"),
-                 None, norm_cat(s.get("category")), s.get("rcs_size")),
+                 None, norm_cat(s.get("category")), s.get("rcs_size"),
+                 s.get("tle_line1"), s.get("tle_line2")),
             )
             norad_to_id[nid] = cur.fetchone()[0]
 
@@ -396,28 +401,29 @@ def main():
                    ON CONFLICT (sensor_id) DO UPDATE SET data_quality=EXCLUDED.data_quality,
                      tracking_objects=EXCLUDED.tracking_objects, last_contact=NOW()""", s)
 
-        # AI recommendations: generated from the REAL high-risk conjunctions.
+        # Rule-based advisories for the riskiest REAL upcoming conjunctions. The
+        # tier comes from the Space-Track (18 SDS) Pc, so the text leads with it.
         cur.execute("""
-            SELECT ce.id, ce.ml_pc, COALESCE(ce.miss_distance_m, ce.miss_distance_km * 1000),
+            SELECT ce.id, ce.raw_pc, ce.ml_pc, COALESCE(ce.miss_distance_m, ce.miss_distance_km * 1000),
                    ce.risk_tier, sa.name, sb.name
             FROM conjunction_events ce
             JOIN satellites sa ON ce.satellite_a_id = sa.id
             JOIN satellites sb ON ce.satellite_b_id = sb.id
             WHERE ce.risk_tier IN ('red','amber')
               AND ce.tca > (NOW() AT TIME ZONE 'UTC')
-            ORDER BY ce.ml_pc DESC LIMIT 12
+            ORDER BY ce.raw_pc DESC NULLS LAST LIMIT 12
         """)
         recs = 0
-        for cid, mlpc, miss, tier, na, nb in cur.fetchall():
-            mlpc = mlpc or 0.0
+        for cid, rawpc, mlpc, miss, tier, na, nb in cur.fetchall():
+            pcs = f"Pc (18 SDS) {(rawpc or 0.0):.1e}, ML estimate {(mlpc or 0.0):.1e}"
             if tier == "red":
                 rtype, prio, conf = "collision-avoidance", "high", 92
-                desc = (f"{na} x {nb}: HIGH risk close approach at {miss:,.0f} m, Pc={mlpc:.2e}. "
-                        f"Recommend immediate maneuver assessment; in-track burn to raise miss distance.")
+                desc = (f"{na} x {nb}: high-risk close approach at {miss:,.0f} m, {pcs}. "
+                        f"Assess an avoidance maneuver; an in-track burn raises miss distance.")
             else:
                 rtype, prio, conf = "conjunction-monitoring", "medium", 80
-                desc = (f"{na} x {nb}: elevated Pc={mlpc:.2e} at {miss:,.0f} m. "
-                        f"Increase observation cadence; prepare contingency maneuver if covariance grows.")
+                desc = (f"{na} x {nb}: elevated risk at {miss:,.0f} m, {pcs}. "
+                        f"Increase observation cadence; prepare a contingency maneuver if covariance grows.")
             cur.execute(
                 """INSERT INTO ai_recommendations (conjunction_id, type, priority, description, confidence)
                    VALUES (%s,%s,%s,%s,%s)""", (cid, rtype, prio, desc, conf))

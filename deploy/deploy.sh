@@ -19,7 +19,9 @@ set -euo pipefail
 PROFILE="${PROFILE:-fe-vm-dod-commercial}"
 APP="${APP:-orbitwatch}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD="$ROOT/.build/app"
+# Stage outside the repo: `databricks sync` honors the repo's .gitignore, which
+# ignores dist/, so a staging folder inside the repo would upload no build output.
+BUILD="${TMPDIR:-/tmp}/orbitwatch-app-build"
 
 cd "$ROOT"
 if [[ -z "${SKIP_BUILD:-}" ]]; then

@@ -19,13 +19,5 @@ env:
     value: "require"
   - name: PG_AUTH_MODE
     value: "sp"
-  - name: ORBITWATCH_CATALOG
-    value: "demo_cg_catalog"
   - name: CHAT_MODEL
     value: "databricks-claude-sonnet-5-5"
-  - name: DATABRICKS_WAREHOUSE_ID
-    valueFrom: sql-warehouse
-  - name: SPACETRACK_USER
-    valueFrom: spacetrack-user
-  - name: SPACETRACK_PASS
-    valueFrom: spacetrack-pass

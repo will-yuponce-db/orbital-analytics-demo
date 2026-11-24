@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS satellites (
     constellation VARCHAR(50),
     category VARCHAR(20) CHECK (category IN ('active','debris','rocket-body')),
     rcs_size VARCHAR(10),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    tle_line1 TEXT,
+    tle_line2 TEXT
 );
 
 -- Orbital elements (latest epoch per satellite)

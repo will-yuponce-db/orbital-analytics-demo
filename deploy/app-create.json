@@ -3,21 +3,6 @@
   "description": "OrbitWatch: space domain awareness and conjunction risk from live Space-Track data",
   "resources": [
     {
-      "name": "sql-warehouse",
-      "description": "Warehouse for ML prediction queries",
-      "sql_warehouse": { "id": "d2710cd32353e1b8", "permission": "CAN_USE" }
-    },
-    {
-      "name": "spacetrack-user",
-      "description": "Space-Track username",
-      "secret": { "scope": "orbitwatch", "key": "spacetrack_user", "permission": "READ" }
-    },
-    {
-      "name": "spacetrack-pass",
-      "description": "Space-Track password",
-      "secret": { "scope": "orbitwatch", "key": "spacetrack_pass", "permission": "READ" }
-    },
-    {
       "name": "postgres",
       "description": "OrbitWatch Lakebase database",
       "postgres": {

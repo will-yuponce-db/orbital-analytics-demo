@@ -329,6 +329,14 @@ function nowIso(offsetHours = 0): string {
   return new Date(Date.now() + offsetHours * 3_600_000).toISOString()
 }
 
+// "Miss 43 m · Pc (ML) 1:248" style label; meters under 1 km, km above.
+function missLabel(missM: number | null, pc: number | null): string {
+  if (missM === null || !(missM > 0)) return ''
+  const miss = missM < 1000 ? `${Math.round(missM)} m` : `${(missM / 1000).toFixed(1)} km`
+  const odds = pc && pc > 0 ? `1:${Math.round(1 / pc).toLocaleString()}` : 'N/A'
+  return `Miss ${miss} · Pc (ML) ${odds}`
+}
+
 interface PcPoint {
   createdAt: string
   pc: number | null
@@ -421,16 +429,6 @@ app.get('/api/health', async (req, res) => {
       .status(500)
       .json({ status: 'error', db: 'disconnected', message: errMessage(err).substring(0, 200) })
   }
-})
-
-app.get('/api/debug-env', (_req, res) => {
-  const dbVars: Record<string, string> = {}
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith('DATABRICKS_') || k.startsWith('PG') || k === 'PORT' || k === 'NODE_ENV') {
-      dbVars[k] = k.includes('SECRET') || k.includes('PASS') ? `[set, len=${v?.length}]` : v || ''
-    }
-  }
-  res.json(dbVars)
 })
 
 // GET /api/conjunctions - one row per conjunction event
@@ -661,12 +659,13 @@ app.get('/api/recommendations', async (req, res) => {
             .map(s => s.trim())
             .filter(Boolean)
         : []
-    let noradFilter = ''
-    const params: unknown[] = []
+    // Upcoming events only: advice on a conjunction whose TCA has passed is moot.
+    const params: unknown[] = [nowIso()]
+    let noradFilter = 'WHERE ce.tca >= $1'
     if (noradList.length > 0) {
-      const placeholders = noradList.map((_, i) => `$${i + 1}`).join(',')
+      const placeholders = noradList.map((_, i) => `$${i + 2}`).join(',')
       params.push(...noradList)
-      noradFilter = `WHERE (sa.norad_id IN (${placeholders}) OR sb.norad_id IN (${placeholders}))`
+      noradFilter += ` AND (sa.norad_id IN (${placeholders}) OR sb.norad_id IN (${placeholders}))`
     }
     const result = await query(
       req,
@@ -804,8 +803,10 @@ app.get('/api/overview', async (req, res) => {
     const now = nowIso()
     const dayAgo = nowIso(-24)
     const upcoming = `${CONJ_FROM} WHERE ce.tca >= $1 AND ce.status = 'active'`
+    // The counts query is required: if Lakebase is unreachable the request
+    // fails (500) instead of reporting zero events. Other tiles are optional.
     const [counts, next, closest, highest, sats, anomalies, fresh, model] = await Promise.all([
-      optionalRows(
+      query(
         req,
         `
         SELECT
@@ -844,7 +845,7 @@ app.get('/api/overview', async (req, res) => {
       ),
       optionalRows(req, 'SELECT * FROM ml_model_summary ORDER BY trained_at DESC LIMIT 1'),
     ])
-    const c = counts[0] ?? {}
+    const c = (counts.rows[0] ?? {}) as Row
     const m = model[0]
     res.json({
       dataAsOf: fresh[0]?.data_as_of ?? null,
@@ -917,330 +918,6 @@ app.post('/api/maneuver-plans', async (req, res) => {
   } catch (err) {
     console.error(err)
     res.status(500).json({ error: 'Failed to save maneuver plan' })
-  }
-})
-
-// ─── Space-Track API helpers ──────────────────────────────────────────────────
-let spaceTrackCookie: string | null = null
-
-async function spaceTrackLogin(): Promise<string> {
-  const user = process.env.SPACETRACK_USER
-  const pass = process.env.SPACETRACK_PASS
-  if (!user || !pass) throw new Error('SPACETRACK_USER and SPACETRACK_PASS env vars required')
-  const resp = await fetch('https://www.space-track.org/ajaxauth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `identity=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`,
-    redirect: 'manual',
-  })
-  const cookies = resp.headers.getSetCookie?.() || []
-  const cookie = cookies.map(c => c.split(';')[0]).join('; ')
-  if (!cookie) throw new Error('Space-Track login failed')
-  spaceTrackCookie = cookie
-  return cookie
-}
-
-async function spaceTrackQuery(path: string): Promise<unknown[]> {
-  if (!spaceTrackCookie) await spaceTrackLogin()
-  let resp = await fetch(`https://www.space-track.org${path}`, {
-    headers: { Cookie: spaceTrackCookie! },
-    signal: AbortSignal.timeout(30000),
-  })
-  // Re-auth if session expired
-  if (resp.status === 401) {
-    await spaceTrackLogin()
-    resp = await fetch(`https://www.space-track.org${path}`, {
-      headers: { Cookie: spaceTrackCookie! },
-      signal: AbortSignal.timeout(30000),
-    })
-  }
-  if (!resp.ok) throw new Error(`Space-Track query failed: ${resp.status}`)
-  return (await resp.json()) as unknown[]
-}
-
-// POST /api/reseed — fetch real CDMs from Space-Track + TLEs, repopulate Lakebase
-app.post('/api/reseed', async (req, res) => {
-  if (isLocalMode) {
-    return res.json({ ok: true, mode: 'local', message: 'Using pre-seeded local data' })
-  }
-  // Destructive: wipes the app tables and reloads raw CDMs straight from
-  // Space-Track, bypassing the Lakeflow pipeline, event de-duplication, and the
-  // ML scores. Data normally flows pipeline -> ML job -> db/reverse_etl.py.
-  if (process.env.ALLOW_RESEED !== '1') {
-    return res.status(403).json({
-      error:
-        'Reseed is disabled. Refresh data with the Lakeflow pipeline and db/reverse_etl.py, or set ALLOW_RESEED=1.',
-    })
-  }
-  try {
-    console.log('[reseed] Starting real data ingestion from Space-Track...')
-
-    // 1. Fetch upcoming CDMs from Space-Track (real Pc values from 18th SDS)
-    const today = new Date().toISOString().slice(0, 10)
-    const cdmPath = `/basicspacedata/query/class/cdm_public/TCA/%3E${today}/orderby/PC%20desc/limit/50/format/json`
-    console.log('[reseed] Fetching CDMs from Space-Track...')
-    const rawCdms = (await spaceTrackQuery(cdmPath)) as Array<Record<string, string>>
-    console.log(`[reseed] Got ${rawCdms.length} raw CDMs`)
-
-    // Deduplicate CDMs: same pair can appear twice with swapped SAT_1/SAT_2
-    const seen = new Set<string>()
-    const cdms: typeof rawCdms = []
-    for (const cdm of rawCdms) {
-      const pairKey = [cdm.SAT_1_ID, cdm.SAT_2_ID].sort().join('-')
-      const tcaKey = `${pairKey}-${cdm.TCA?.slice(0, 16)}`
-      if (seen.has(tcaKey)) continue
-      seen.add(tcaKey)
-      cdms.push(cdm)
-    }
-    console.log(`[reseed] ${cdms.length} unique CDMs after dedup`)
-
-    // 2. Collect unique NORAD IDs and fetch GP data (with TLE lines)
-    const noradIds = new Set<string>()
-    for (const cdm of cdms) {
-      noradIds.add(cdm.SAT_1_ID)
-      noradIds.add(cdm.SAT_2_ID)
-    }
-
-    // Also add some well-known satellites for the catalog
-    const extraSats = ['25544', '48274', '56780', '44713'] // ISS, Starlink, OneWeb, Starlink
-    for (const id of extraSats) noradIds.add(id)
-
-    console.log(`[reseed] Fetching GP data for ${noradIds.size} satellites from Space-Track...`)
-    const noradList = [...noradIds].join(',')
-    const gpPath = `/basicspacedata/query/class/gp/NORAD_CAT_ID/${noradList}/orderby/NORAD_CAT_ID/format/json`
-    const gpData = (await spaceTrackQuery(gpPath)) as Array<Record<string, string>>
-    console.log(`[reseed] Got ${gpData.length} GP records`)
-
-    // Also fetch some extra Starlinks and debris for the catalog
-    const extraGroups = [
-      `/basicspacedata/query/class/gp/OBJECT_NAME/STARLINK~~/orderby/NORAD_CAT_ID/limit/15/format/json`,
-      `/basicspacedata/query/class/gp/OBJECT_NAME/COSMOS 2251 DEB~~/orderby/NORAD_CAT_ID/limit/10/format/json`,
-      `/basicspacedata/query/class/gp/OBJECT_NAME/FENGYUN 1C DEB~~/orderby/NORAD_CAT_ID/limit/8/format/json`,
-      `/basicspacedata/query/class/gp/OBJECT_NAME/ONEWEB~~/orderby/NORAD_CAT_ID/limit/5/format/json`,
-    ]
-    const extraResults = await Promise.all(extraGroups.map(p => spaceTrackQuery(p).catch(() => [])))
-    for (const group of extraResults) {
-      for (const gp of group as Array<Record<string, string>>) {
-        if (!gpData.find(g => g.NORAD_CAT_ID === gp.NORAD_CAT_ID)) {
-          gpData.push(gp)
-        }
-      }
-    }
-    console.log(`[reseed] Total GP records: ${gpData.length}`)
-
-    // 3. Write to Lakebase
-    console.log('[reseed] Writing to Lakebase...')
-    const client = new Client({
-      host: process.env.PGHOST,
-      port: parseInt(process.env.PGPORT || '5432'),
-      database: process.env.PGDATABASE || 'orbitwatch',
-      user: process.env.PGUSER || process.env.DATABRICKS_CLIENT_ID || 'will.yuponce@databricks.com',
-      password: await getPgPassword(req),
-      ssl: { rejectUnauthorized: false },
-      connectionTimeoutMillis: 10000,
-    })
-    await client.connect()
-    try {
-      await client.query('BEGIN')
-      // Clear all dependent tables first (anomaly_events has FK to satellites)
-      await client.query('DELETE FROM ai_recommendations')
-      await client.query('DELETE FROM maneuver_plans')
-      await client.query('DELETE FROM conjunction_events')
-      await client.query('DELETE FROM orbital_elements')
-      await client.query('DELETE FROM tracking_network')
-      try {
-        await client.query('DELETE FROM anomaly_events')
-      } catch {
-        /* table may not exist */
-      }
-      await client.query('DELETE FROM satellites')
-
-      // Insert satellites from GP data
-      const satIdMap = new Map<string, number>()
-      for (const gp of gpData) {
-        const noradId = gp.NORAD_CAT_ID
-        const name = gp.OBJECT_NAME || noradId
-        const objType = gp.OBJECT_TYPE || ''
-        const category =
-          objType === 'DEBRIS' ? 'debris' : objType === 'ROCKET BODY' ? 'rocket-body' : 'active'
-        const operator = name.startsWith('STARLINK')
-          ? 'SpaceX'
-          : name.startsWith('ONEWEB')
-            ? 'OneWeb'
-            : name.startsWith('IRIDIUM')
-              ? 'Iridium'
-              : name.includes('ISS')
-                ? 'NASA/Roscosmos'
-                : gp.COUNTRY_CODE || null
-        const constellation = name.startsWith('STARLINK')
-          ? 'Starlink'
-          : name.startsWith('ONEWEB')
-            ? 'OneWeb'
-            : name.startsWith('IRIDIUM')
-              ? 'Iridium NEXT'
-              : null
-
-        const satRes = await client.query(
-          `INSERT INTO satellites (norad_id, name, category, operator, constellation, rcs_size, tle_line1, tle_line2)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (norad_id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, operator=EXCLUDED.operator, tle_line1=EXCLUDED.tle_line1, tle_line2=EXCLUDED.tle_line2 RETURNING id`,
-          [
-            noradId,
-            name,
-            category,
-            operator,
-            constellation,
-            gp.RCS_SIZE || null,
-            gp.TLE_LINE1 || null,
-            gp.TLE_LINE2 || null,
-          ]
-        )
-        const satId = satRes.rows[0].id
-        satIdMap.set(noradId, satId)
-
-        // Insert orbital elements from GP record
-        const epoch = gp.EPOCH || new Date().toISOString()
-        const sma = parseFloat(gp.SEMIMAJOR_AXIS || '0')
-        const altKm = sma ? sma - 6371 : parseFloat(gp.APOAPSIS || '0')
-        const ecc = parseFloat(gp.ECCENTRICITY || '0')
-        const incl = parseFloat(gp.INCLINATION || '0')
-        const raan = parseFloat(gp.RA_OF_ASC_NODE || '0')
-        const argP = parseFloat(gp.ARG_OF_PERICENTER || '0')
-        const ma = parseFloat(gp.MEAN_ANOMALY || '0')
-        const mm = parseFloat(gp.MEAN_MOTION || '0')
-        const bstar = parseFloat(gp.BSTAR || '0')
-        const velKms = sma ? Math.sqrt(398600.4418 / sma) : 7.5
-
-        await client.query(
-          `INSERT INTO orbital_elements (satellite_id, epoch, semi_major_axis, eccentricity, inclination, raan, arg_of_perigee, mean_anomaly, mean_motion, bstar, altitude_km, velocity_kms)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-           ON CONFLICT (satellite_id, epoch) DO NOTHING`,
-          [satId, epoch, sma, ecc, incl, raan, argP, ma, mm, bstar, altKm, velKms]
-        )
-      }
-
-      // Insert conjunction events from real CDMs
-      let insertedConj = 0
-      for (const cdm of cdms) {
-        const satAId = satIdMap.get(cdm.SAT_1_ID)
-        const satBId = satIdMap.get(cdm.SAT_2_ID)
-        if (!satAId || !satBId) continue
-        const pc = parseFloat(cdm.PC || '0')
-        const missM = parseFloat(cdm.MIN_RNG || '0') // Space-Track MIN_RNG is in meters
-        const missKm = missM / 1000
-        const riskTier = pc > 1e-3 ? 'red' : pc > 1e-4 ? 'amber' : 'green'
-        const maneuverRecommended = pc > 1e-4
-        const tca = cdm.TCA
-        const tcaDate = new Date(tca)
-        const maneuverOpen = new Date(tcaDate.getTime() - 48 * 3600000).toISOString()
-        const maneuverClose = new Date(tcaDate.getTime() - 6 * 3600000).toISOString()
-
-        await client.query(
-          `INSERT INTO conjunction_events (cdm_id, satellite_a_id, satellite_b_id, tca, miss_distance_km, raw_pc, ml_pc, risk_tier, maneuver_recommended, maneuver_window_open, maneuver_window_close, status, miss_distance_m, cdm_count, first_pc, max_pc)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,1,$6,$6)
-           ON CONFLICT (cdm_id) DO NOTHING`,
-          [
-            cdm.CDM_ID,
-            satAId,
-            satBId,
-            tca,
-            missKm,
-            pc,
-            pc,
-            riskTier,
-            maneuverRecommended,
-            maneuverOpen,
-            maneuverClose,
-            missM,
-          ]
-        )
-        insertedConj++
-
-        // AI recommendation per conjunction
-        const conjRes = await client.query(`SELECT id FROM conjunction_events WHERE cdm_id = $1`, [
-          cdm.CDM_ID,
-        ])
-        if (conjRes.rows.length > 0) {
-          const conjId = conjRes.rows[0].id
-          const recType =
-            pc > 1e-3
-              ? 'collision-avoidance'
-              : pc > 1e-4
-                ? 'conjunction-monitoring'
-                : 'orbital-adjustment'
-          const priority = pc > 1e-3 ? 'high' : pc > 1e-4 ? 'medium' : 'low'
-          const confidence = pc > 1e-3 ? 92 : pc > 1e-4 ? 78 : 65
-          const pcStr = pc > 0 ? `1:${Math.round(1 / pc).toLocaleString()}` : 'N/A'
-          const desc =
-            pc > 1e-3
-              ? `HIGH RISK: ${cdm.SAT_1_NAME} and ${cdm.SAT_2_NAME} conjunction at ${Math.round(missM).toLocaleString()} m miss distance. Pc=${pcStr} (18th SDS). ${cdm.EMERGENCY_REPORTABLE === 'Y' ? 'EMERGENCY REPORTABLE EVENT.' : ''} Recommend immediate maneuver assessment.`
-              : pc > 1e-4
-                ? `ELEVATED: ${cdm.SAT_1_NAME} × ${cdm.SAT_2_NAME} close approach. Pc=${pcStr}, miss distance ${Math.round(missM).toLocaleString()} m. Increase observation cadence and prepare contingency maneuver.`
-                : `MONITOR: ${cdm.SAT_1_NAME} near ${cdm.SAT_2_NAME}. Pc=${pcStr} at ${Math.round(missM).toLocaleString()} m. Standard tracking sufficient.`
-          await client.query(
-            `INSERT INTO ai_recommendations (conjunction_id, type, priority, description, confidence) VALUES ($1,$2,$3,$4,$5)`,
-            [conjId, recType, priority, desc, confidence]
-          )
-        }
-      }
-
-      // Insert tracking network sensors
-      const sensors = [
-        ['leo-radar-ak', 'LEO Radar Network (Alaska)', 'radar', 'Clear AFS, Alaska', 96, 4200],
-        ['polar-radar-scan', 'Polar Radar Array (Scandinavia)', 'radar', 'Vardø, Norway', 94, 3800],
-        ['optical-hi', 'Optical Network (Hawaii)', 'optical', 'Maui, Hawaii', 92, 2900],
-        ['optical-nm', 'Optical Network (New Mexico)', 'optical', 'Socorro, New Mexico', 90, 2600],
-        ['space-sensor', 'Space-Based Sensor (LEO, 630 km)', 'space-based', 'LEO Orbit', 98, 8500],
-        [
-          'southern-radar',
-          'Southern Hemisphere Radar (Australia)',
-          'radar',
-          'Pine Gap, Australia',
-          88,
-          3100,
-        ],
-        ['sband-radar', 'S-Band Radar (Alaska)', 'radar', 'Cobra Dane, Alaska', 95, 5200],
-        [
-          'equatorial-optical',
-          'Equatorial Optical Array (Diego Garcia)',
-          'optical',
-          'Diego Garcia',
-          91,
-          2400,
-        ],
-        ['cband-track', 'C-Band Tracking (Kwajalein)', 'radar', 'Kwajalein Atoll', 89, 1800],
-      ]
-      for (const [sensorId, sName, sType, loc, quality, tracking] of sensors) {
-        await client.query(
-          `INSERT INTO tracking_network (sensor_id, sensor_name, sensor_type, location, data_quality, tracking_objects, status)
-           VALUES ($1,$2,$3,$4,$5,$6,'active') ON CONFLICT (sensor_id) DO NOTHING`,
-          [sensorId, sName, sType, loc, quality, tracking]
-        )
-      }
-
-      await client.query('COMMIT')
-      const summary = {
-        ok: true,
-        source: 'Space-Track (18th SDS)',
-        satellites: gpData.length,
-        conjunctions: insertedConj,
-        totalCdms: rawCdms.length,
-        uniqueCdms: cdms.length,
-        highestPc: cdms[0]
-          ? `Pc=${parseFloat(cdms[0].PC).toFixed(6)} ${cdms[0].SAT_1_NAME} × ${cdms[0].SAT_2_NAME}`
-          : 'none',
-      }
-      console.log('[reseed] Complete:', summary)
-      res.json(summary)
-    } catch (err) {
-      await client.query('ROLLBACK')
-      throw err
-    } finally {
-      await client.end().catch(() => {})
-    }
-  } catch (err) {
-    console.error('/api/reseed error:', err)
-    res.status(500).json({ error: String(err) })
   }
 })
 
@@ -1448,45 +1125,16 @@ async function executeToolCall(
       }
       case 'get_ml_predictions': {
         const limit = (args.limit as number) || 10
-        // Served from the Lakebase copy first; the warehouse query is a fallback.
-        try {
-          const r = await pgClient.query(
-            `
-            SELECT sat_1_name, sat_2_name, raw_pc, ml_pc, calibration_ratio, raw_risk_tier,
-                   ml_risk_tier, risk_changed, miss_distance_km
-            FROM ml_predictions ORDER BY ml_pc DESC NULLS LAST LIMIT $1
-          `,
-            [limit]
-          )
-          if (r.rows.length > 0) return JSON.stringify(r.rows)
-        } catch {
-          /* ml_predictions not loaded yet */
-        }
-        const host = process.env.DATABRICKS_HOST || ''
-        const token = await getM2MToken()
-        const baseUrl = host.startsWith('http') ? host : `https://${host}`
-        const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
-        const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            statement: `SELECT sat_1_name, sat_2_name, raw_pc, ml_pc, calibration_ratio, raw_risk_tier, ml_risk_tier, risk_changed, miss_distance_km FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.conjunction_predictions ORDER BY ml_pc DESC LIMIT ${limit}`,
-            warehouse_id: wh,
-            format: 'JSON_ARRAY',
-            wait_timeout: '30s',
-          }),
-        })
-        const sqlData = (await sqlResp.json()) as {
-          manifest?: { schema?: { columns?: { name: string }[] } }
-          result?: { data_array?: unknown[][] }
-        }
-        const cols = sqlData.manifest?.schema?.columns?.map(c => c.name) || []
-        const rows = (sqlData.result?.data_array || []).map(row => {
-          const obj: Record<string, unknown> = {}
-          cols.forEach((c, i) => (obj[c] = row[i]))
-          return obj
-        })
-        return JSON.stringify(rows)
+        // ML scores are copied into Lakebase by db/reverse_etl.py.
+        const r = await pgClient.query(
+          `
+          SELECT sat_1_name, sat_2_name, tca, miss_distance_m, raw_pc, ml_pc, calibration_ratio,
+                 raw_risk_tier, ml_risk_tier, risk_changed
+          FROM ml_predictions WHERE tca >= $2 ORDER BY ml_pc DESC NULLS LAST LIMIT $1
+        `,
+          [limit, nowIso()]
+        )
+        return JSON.stringify(r.rows)
       }
       case 'get_satellite_info': {
         const noradId = args.norad_id as string
@@ -1572,6 +1220,19 @@ async function executeToolCall(
   }
 }
 
+// Claude 5.x replies can carry content as a list of parts instead of a string.
+function contentText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map(p =>
+        p && typeof p === 'object' && 'text' in p ? String((p as { text: unknown }).text) : ''
+      )
+      .join('')
+  }
+  return ''
+}
+
 // POST /api/chat — Agentic AI chat with tool calling
 app.post('/api/chat', async (req, res) => {
   if (isLocalMode) {
@@ -1650,7 +1311,7 @@ Current time: ${new Date().toISOString()}`
 
       // If no tool calls, we're done
       if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
-        return res.json({ role: 'assistant', content: (assistantMsg.content || '').trim() })
+        return res.json({ role: 'assistant', content: contentText(assistantMsg.content).trim() })
       }
 
       // Execute tool calls and add results
@@ -1686,7 +1347,10 @@ Current time: ${new Date().toISOString()}`
 
     // If we hit max iterations, return last assistant message
     const lastAssistant = currentMessages.filter(m => m.role === 'assistant').pop()
-    res.json({ role: 'assistant', content: lastAssistant?.content || 'Analysis complete.' })
+    res.json({
+      role: 'assistant',
+      content: contentText(lastAssistant?.content).trim() || 'Analysis complete.',
+    })
   } catch (err) {
     console.error('[chat] Error:', err)
     res.status(500).json({ error: 'Chat failed', detail: String(err) })
@@ -1775,47 +1439,17 @@ app.get('/api/ml/predictions', async (req, res) => {
       params.push(...noradList)
       filter = `WHERE (sat_1_norad_id IN (${ph}) OR sat_2_norad_id IN (${ph}))`
     }
-    // Lakebase copy first (loaded by db/reverse_etl.py): no warehouse round
-    // trip, and no Unity Catalog grants needed for the app's service principal.
-    try {
-      const r = await query(
-        req,
-        `SELECT * FROM ml_predictions ${filter} ORDER BY ml_pc DESC NULLS LAST LIMIT $1`,
-        params
-      )
-      if (r.rows.length > 0) return res.json(r.rows)
-    } catch {
-      /* not loaded yet: fall back to the warehouse */
-    }
-    const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
-    const host = process.env.DATABRICKS_HOST || ''
-    const token = await getM2MToken()
-    const baseUrl = host.startsWith('http') ? host : `https://${host}`
-    const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        statement: `SELECT * FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.conjunction_predictions ${filter} ORDER BY ml_pc DESC LIMIT ${limit}`,
-        warehouse_id: wh,
-        format: 'JSON_ARRAY',
-        wait_timeout: '30s',
-      }),
-    })
-    if (!sqlResp.ok) throw new Error(`SQL API ${sqlResp.status}`)
-    const sqlData = (await sqlResp.json()) as {
-      manifest?: { schema?: { columns?: { name: string }[] } }
-      result?: { data_array?: unknown[][] }
-    }
-    const cols = sqlData.manifest?.schema?.columns?.map((c: { name: string }) => c.name) || []
-    const rows = (sqlData.result?.data_array || []).map((row: unknown[]) => {
-      const obj: Record<string, unknown> = {}
-      cols.forEach((c: string, i: number) => (obj[c] = row[i]))
-      return obj
-    })
-    res.json(rows)
+    // Lakebase copy of orbitwatch_ml.conjunction_predictions (db/reverse_etl.py),
+    // so the app needs no warehouse and no Unity Catalog grants.
+    const r = await query(
+      req,
+      `SELECT * FROM ml_predictions ${filter} ORDER BY ml_pc DESC NULLS LAST LIMIT $1`,
+      params
+    )
+    res.json(r.rows)
   } catch (err) {
     console.error('GET /api/ml/predictions error:', err)
-    res.json([]) // graceful fallback
+    res.json([]) // not loaded yet: the UI shows its empty state
   }
 })
 
@@ -1838,38 +1472,8 @@ app.get('/api/ml/summary', async (req, res) => {
     })
   }
   try {
-    try {
-      const r = await query(req, 'SELECT * FROM ml_model_summary ORDER BY trained_at DESC LIMIT 1')
-      if (r.rows.length > 0) return res.json(r.rows[0])
-    } catch {
-      /* not loaded yet: fall back to the warehouse */
-    }
-    const host = process.env.DATABRICKS_HOST || ''
-    const token = await getM2MToken()
-    const wh = process.env.DATABRICKS_WAREHOUSE_ID || '07849a8a81885289'
-    const baseUrl = host.startsWith('http') ? host : `https://${host}`
-    const sqlResp = await fetch(`${baseUrl}/api/2.0/sql/statements`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        statement: `SELECT * FROM ${process.env.ORBITWATCH_CATALOG || 'will_wy_demo_catalog'}.orbitwatch_ml.model_summary ORDER BY trained_at DESC LIMIT 1`,
-        warehouse_id: wh,
-        format: 'JSON_ARRAY',
-        wait_timeout: '30s',
-      }),
-    })
-    if (!sqlResp.ok) throw new Error(`SQL API ${sqlResp.status}`)
-    const sqlData = (await sqlResp.json()) as {
-      manifest?: { schema?: { columns?: { name: string }[] } }
-      result?: { data_array?: unknown[][] }
-    }
-    const cols = sqlData.manifest?.schema?.columns?.map((c: { name: string }) => c.name) || []
-    const rows = (sqlData.result?.data_array || []).map((row: unknown[]) => {
-      const obj: Record<string, unknown> = {}
-      cols.forEach((c: string, i: number) => (obj[c] = row[i]))
-      return obj
-    })
-    res.json(rows[0] || null)
+    const r = await query(req, 'SELECT * FROM ml_model_summary ORDER BY trained_at DESC LIMIT 1')
+    res.json(r.rows[0] || null)
   } catch (err) {
     console.error('GET /api/ml/summary error:', err)
     res.json(null)
@@ -1921,6 +1525,7 @@ app.get('/api/timeline', async (req, res) => {
           ce.cdm_id,
           ce.tca as event_time,
           ce.miss_distance_km,
+          ce.miss_distance_m,
           ce.ml_pc,
           ce.risk_tier,
           ce.status,
@@ -1967,11 +1572,12 @@ app.get('/api/timeline', async (req, res) => {
         cdmId: r.cdm_id,
         eventTime: r.event_time,
         label: `${r.sat_a_name} × ${r.sat_b_name}`,
-        sublabel: r.miss_distance_km
-          ? `Miss ${Number(r.miss_distance_km).toFixed(3)} km · Pc 1:${r.ml_pc > 0 ? Math.round(1 / r.ml_pc).toLocaleString() : 'N/A'}`
-          : '',
+        sublabel: missLabel(
+          num(r.miss_distance_m) ?? (num(r.miss_distance_km) ?? 0) * 1000,
+          num(r.ml_pc)
+        ),
         severity: r.risk_tier,
-        status: r.status,
+        status: new Date(r.event_time).getTime() < Date.now() ? 'passed' : r.status,
       })),
       ...anomResult.rows.map(r => ({
         type: 'anomaly',
@@ -1993,6 +1599,11 @@ app.get('/api/timeline', async (req, res) => {
 })
 
 // Serve React app in production
+// Unknown API routes get a JSON 404 instead of the SPA's index.html.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found' })
+})
+
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(process.cwd(), 'dist')))
   app.get('/{*splat}', (req, res) => {

@@ -29,7 +29,7 @@ LAKEBASE_HOST=<endpoint host> WAREHOUSE_ID=<warehouse id> CATALOG=demo_cg_catalo
 ## Deploy the app
 
 ```bash
-deploy/deploy.sh            # builds, assembles .build/app, uploads, deploys
+deploy/deploy.sh            # builds, stages a small upload folder, uploads, deploys
 ```
 
 Databricks Apps rejects any file over 10 MB, so the script never ships
