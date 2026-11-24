@@ -1,0 +1,29 @@
+# Databricks Apps runs `npm install` from package.json (runtime deps only),
+# then this command. Client is prebuilt in dist/, server in server/dist/.
+command:
+  - "node"
+  - "server/dist/server/index.js"
+
+env:
+  - name: NODE_ENV
+    value: "production"
+  - name: PORT
+    value: "8000"
+  - name: PGHOST
+    value: "ep-steep-meadow-d2vuhdb5.database.us-east-1.cloud.databricks.com"
+  - name: PGPORT
+    value: "5432"
+  - name: PGDATABASE
+    value: "orbitwatch"
+  - name: PGSSLMODE
+    value: "require"
+  - name: PG_AUTH_MODE
+    value: "sp"
+  - name: ORBITWATCH_CATALOG
+    value: "demo_cg_catalog"
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: SPACETRACK_USER
+    valueFrom: spacetrack-user
+  - name: SPACETRACK_PASS
+    valueFrom: spacetrack-pass

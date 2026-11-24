@@ -23,3 +23,15 @@ dist-ssr
 *.sln
 *.sw?
 
+# Local SQLite dev database
+server/db/local.sqlite
+server/db/local.sqlite-wal
+server/db/local.sqlite-shm
+
+# Databricks bundle/sync state and the assembled Apps deploy folder
+.databricks/
+.build/
+node_modules.tar.gz
+
+# Internal demo-catalog entry (has personal contact details); keep it out of this public repo
+DEMO_CATALOG.md
